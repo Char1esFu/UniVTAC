@@ -13,15 +13,17 @@
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/byml-c/UniVTAC.git
+git clone git@github.com:Char1esFu/UniVTAC.git
 cd UniVTAC
+# Pull LFS assets
+git -C third_party/TacEx lfs pull
 ```
 
 ### Step 2: Create a Conda Environment
 
 ```bash
-conda create -n UniVTAC python=3.10 -y
-conda activate UniVTAC
+mamba create -n UniVTAC python=3.10 -y
+mamba activate UniVTAC
 ```
 
 ### Step 3: Install TacEx (Modified Source)
@@ -44,25 +46,32 @@ If you have a working Isaac Lab environment, you can directly install TacEx. Oth
 
 ```bash
 # install cuda-enabled pytorch
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install --upgrade pip
 # install isaac sim packages
 pip install 'isaacsim[all,extscache]==4.5.0' --extra-index-url https://pypi.nvidia.com
+
+# manually install flatdict
+pip install "setuptools<81" wheel
+pip install --no-build-isolation flatdict==4.0.1
+pip install "setuptools==82.0.1"
+
+pip install transforms3d
 ```
 
-> verify that the Isaac Sim installation works by calling `isaacsim` in the terminal
+> verify that the Isaac Sim installation works by calling `isaacsim isaacsim.exp.full.kit` or `isaacsim isaacsim.exp.full.streaming --no-window --/app/extensions/isaacsim.ros2.bridge/enabled=false`in the terminal
 
 #### Isaac Lab
 
 ```bash
 # install dependencies via apt (Ubuntu)
-sudo apt install cmake build-essential
+sudo apt install cmake build-essential git-lfs
 git clone https://github.com/isaac-sim/IsaacLab
 cd IsaacLab
 # use Isaac Lab version 2.1.1
+git fetch --tags
 git checkout v2.1.1
-# activate the Isaac Sim python env
-conda activate UniVTAC
+
 # install isaaclab extensions (with --editable flag)
 ./isaaclab.sh --install # or "./isaaclab.sh -i"
 ```
@@ -70,7 +79,6 @@ conda activate UniVTAC
 To verify the Isaac Lab Installation:
 
 ```bash
-conda activate UniVTAC
 python scripts/reinforcement_learning/rsl_rl/train.py --task=Isaac-Ant-v0 --headless
 ```
 
@@ -78,12 +86,7 @@ python scripts/reinforcement_learning/rsl_rl/train.py --task=Isaac-Ant-v0 --head
 
 #### Installing TacEx [Core]
 
-**1.** Activate the Isaac Env
-```bash
-conda activate UniVTAC
-```
-
-**2.** Install the core packages of TacEx
+**1.** Install the core packages of TacEx
 ```bash
 # Script will pip install core TacEx packages with --editable flag)
 ./tacex.sh -i
@@ -91,7 +94,7 @@ conda activate UniVTAC
 
 > You can install the extensions one by one via e.g. `python -m pip install -e source/tacex_uipc`
 
-**3.** Verify that TacEx works by running an example:
+**2.** Verify that TacEx works by running an example:
 
 ```bash
 python ./scripts/demos/tactile_sim_approaches/check_taxim_sim.py --debug_vis
@@ -128,16 +131,14 @@ export CMAKE_TOOLCHAIN_FILE="$HOME/Toolchain/vcpkg/scripts/buildsystems/vcpkg.cm
 
 ```bash
 # Inside the root dir of TacEx repo
-conda activate UniVTAC
-conda env update -n UniVTAC --file ./source/tacex_uipc/libuipc/conda/env.yaml
-mamba install -n UniVTAC -c conda-forge sysroot_linux-64=2.34
+mamba env update -n UniVTAC --file ./source/tacex_uipc/libuipc/conda/env.yaml
+mamba install -n UniVTAC -c conda-forge sysroot_linux-64=2.34 ffmpeg
 ```
 > If Cuda 12.4 does not work for, try updating your Nvidia drivers or try to use an older Cuda version by adjusting the env.yaml file (e.g. Cuda 12.2).
 
 **2.** Install `tacex_uipc`
 ```bash
 # This also builds `libuipc` and pip installs the python bindings.
-conda activate UniVTAC
 pip install -e source/tacex_uipc -v
 ```
 > You can also install all TacEx packages with `./tacex.sh -i all`.
@@ -151,3 +152,10 @@ python ./scripts/benchmarking/tactile_sim_performance/run_ball_rolling_experimen
 ### Step 4: Install cuRobo
 
 cuRobo is used for GPU-accelerated collision-aware motion planning. Follow the official [cuRobo Installation Guide](https://curobo.org/get_started/1_install_instructions.html).
+```bash
+git clone https://github.com/NVlabs/curobo.git
+cd curobo
+git fetch --tags
+git checkout v0.7.8
+pip install -e . --no-build-isolation
+```
