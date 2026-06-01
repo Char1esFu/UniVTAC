@@ -28,7 +28,7 @@ class RobotManager:
         self.task = task
         self.device = task.device
         self.sensor_type = task.cfg.tactile_sensor_type
-        if self.sensor_type in ['gsmini', 'gf225', 'xsensews']: # franka panda
+        if self.sensor_type in ['gsmini', 'gf225', 'xensews']: # franka panda
             self.robot_type = 'franka_panda'
 
         self.robot = Articulation(self.cfg.robot)

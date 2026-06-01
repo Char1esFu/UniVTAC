@@ -2,8 +2,9 @@ from curobo.geom.transform import pose_multiply
 import numpy as np
 import transforms3d as t3d
 from curobo.types.robot import JointState
-from curobo.util.usd_helper import UsdHelper
+from curobo.util.usd_helper import UsdHelper, WorldConfig
 from curobo.types.math import Pose as CuroboPose
+from curobo.geom.types import Mesh
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.wrap.reacher.motion_gen import (
     MotionGen,
@@ -76,7 +77,7 @@ class CuroboPlanner:
             rotation_threshold=0.01,
             high_precision=True,
             collision_checker_type=CollisionCheckerType.MESH,
-            collision_activation_distance=0.4
+            collision_activation_distance=0.0
         )
         self.motion_gen = MotionGen(motion_gen_config)
         self.motion_gen.warmup()
@@ -85,21 +86,18 @@ class CuroboPlanner:
         self.motion_gen.reset()
 
     def get_curr_world_cfg(self):
-        # obstacles = self.usd_helper.get_obstacles_from_stage(
-        #     only_paths=["/World"],
-        #     reference_prim_path=self.robot_prime_path,
-        #     ignore_substring=['/World/defaultGroundPlane', '/World/visualize/*', self.robot_prime_path]
-        # ).get_collision_check_world()
-        obstacles = {
-            "cuboid": {
-                "table": {
-                    "dims": [0.5, 0, 0],
-                    "pose": [-1000, 0.0, 0.0, 1, 0, 0, 0],
-                },
-            }
-        }
+        obstacles = self.usd_helper.get_obstacles_from_stage(
+            reference_prim_path='/World/envs/env_0/Robot',
+            only_paths=[
+                '/World/envs/env_0/ground_plate'
+            ],
+        ).get_collision_check_world()
+
+        for name, actor in self.task._actor_manager.actors.items():
+            mesh = Mesh.from_pointcloud(actor.vertices, pitch=0.005, name=name)
+            obstacles.add_obstacle(mesh)
         return obstacles
- 
+
     def update_world(self):
         self.motion_gen.update_world(self.get_curr_world_cfg())
 
@@ -113,7 +111,7 @@ class CuroboPlanner:
         constraint_pose=None,
         time_dilation_factor=None
     ):
-        # self.update_world()
+        self.update_world()
         target_pose = calculate_target_pose(
             real_robot_pose, self.robot_origin_pose, target_ee_pose)
         # transformation from world to arm's base
