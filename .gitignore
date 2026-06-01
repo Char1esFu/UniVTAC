@@ -4,7 +4,7 @@
 !tools/setup_vscode.py
 !extensions.json
 !tasks.json
-/.vscode
+# /.vscode
 
 # Ignore all other files
 /*.json
@@ -53,3 +53,8 @@ textures.zip
 **/act-ckpt/*
 /*.png
 **/tmp.png
+
+/${data}
+
+# agent
+.claude/

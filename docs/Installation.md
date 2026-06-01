@@ -130,6 +130,7 @@ export CMAKE_TOOLCHAIN_FILE="$HOME/Toolchain/vcpkg/scripts/buildsystems/vcpkg.cm
 # Inside the root dir of TacEx repo
 conda activate UniVTAC
 conda env update -n UniVTAC --file ./source/tacex_uipc/libuipc/conda/env.yaml
+mamba install -n UniVTAC -c conda-forge sysroot_linux-64=2.34
 ```
 > If Cuda 12.4 does not work for, try updating your Nvidia drivers or try to use an older Cuda version by adjusting the env.yaml file (e.g. Cuda 12.2).
 

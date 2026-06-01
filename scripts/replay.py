@@ -40,6 +40,7 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 args_cli.livestream = 2
+# args_cli.headless = False
 args_cli.num_envs = 1
 
 if args_cli.gpu is not None:
