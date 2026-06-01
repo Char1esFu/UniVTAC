@@ -159,3 +159,9 @@ git fetch --tags
 git checkout v0.7.8
 pip install -e . --no-build-isolation
 ```
+
+### Step 5: Download dataset from HuggingFace
+```bash
+pip install huggingface_hub
+bash data/download.sh
+```
