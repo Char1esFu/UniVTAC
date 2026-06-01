@@ -1,0 +1,21 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.defaultInterpreterPath": "${env:HOME}/miniforge3/envs/UniVTAC/bin/python",
+    "python.analysis.extraPaths": [
+        "${env:HOME}/Projects/IsaacLab/source/isaaclab",
+        "${env:HOME}/Projects/IsaacLab/source/isaaclab_assets",
+        "${env:HOME}/Projects/IsaacLab/source/isaaclab_rl",
+        "${env:HOME}/Projects/IsaacLab/source/isaaclab_tasks",
+        "${env:HOME}/Projects/IsaacLab/source/isaaclab_mimic",
+        "${workspaceFolder}/third_party/TacEx/source/tacex",
+        "${workspaceFolder}/third_party/TacEx/source/tacex_assets",
+        "${workspaceFolder}/third_party/TacEx/source/tacex_tasks",
+        "${workspaceFolder}/third_party/TacEx/source/tacex_uipc"
+    ],
+    "python.analysis.useLibraryCodeForTypes": true,
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingModuleSource": "none",
+        "reportMissingImports": "none"
+    }
+}
