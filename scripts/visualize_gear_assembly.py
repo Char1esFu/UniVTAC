@@ -17,8 +17,6 @@ Usage:
 """
 
 import argparse
-import os
-import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -35,13 +33,6 @@ args_cli.livestream = 2
 args_cli.enable_cameras = True
 args_cli.num_envs = 1
 
-# AppLauncher emits `--/app/livestream/publicEndpointAddress=$PUBLIC_IP` itself
-# (default 127.0.0.1), so override via the env var rather than sys.argv — any
-# manual sys.argv entry would be appended *before* AppLauncher's, and carb
-# takes the last value wins.
-os.environ["PUBLIC_IP"] = subprocess.check_output(
-    ["tailscale", "ip", "-4"], text=True
-).strip().splitlines()[0]
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
