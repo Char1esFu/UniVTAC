@@ -14,7 +14,7 @@ models:
     initial_log_std: 0.0
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [512, 256, 128]
         activations: elu
     output: ACTIONS
@@ -23,7 +23,7 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [512, 256, 128]
         activations: elu
     output: ONE
@@ -44,13 +44,13 @@ agent:
   learning_epochs: 5
   mini_batches: 12
   discount_factor: 0.998
-  lambda: 0.95
+  gae_lambda: 0.95
   learning_rate: 5.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.016
-  state_preprocessor: RunningStandardScaler
-  state_preprocessor_kwargs: null
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
   random_timesteps: 0
@@ -58,7 +58,6 @@ agent:
   grad_norm_clip: 1.0
   ratio_clip: 0.2
   value_clip: 0.2
-  clip_predicted_values: True
   entropy_loss_scale: 0.002
   value_loss_scale: 2.0
   kl_threshold: 0.0

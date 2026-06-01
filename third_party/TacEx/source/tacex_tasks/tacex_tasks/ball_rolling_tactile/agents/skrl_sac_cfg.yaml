@@ -13,7 +13,7 @@ models: #! model cfg not used yet in train_sac.py
     max_log_std: 2.0
     network:
     - name: net
-      input: "Shape.STATES"
+      input: "Shape.OBSERVATIONS"
       layers: [256, 128, 64]
       activations: ["elu", "elu", "elu"]
     output: ACTIONS
@@ -22,7 +22,7 @@ models: #! model cfg not used yet in train_sac.py
     clip_actions: False
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [256, 128, 64]
         activations: ["elu", "elu", "elu"]
     output: ONE
@@ -41,8 +41,8 @@ agent:
   critic_learning_rate": 1e-3   # critic learning rate
   learning_rate_scheduler": None        # learning rate scheduler class (see torch.optim.lr_scheduler)
   learning_rate_scheduler_kwargs": {}   # learning rate scheduler's kwargs (e.g. {"step_size": 1e-3})
-  state_preprocessor": RunningStandardScaler             # state preprocessor class (see skrl.resources.preprocessors)
-  state_preprocessor_kwargs": {"size": env.observation_space, "device": device}        # state preprocessor's kwargs (e.g. {"size": env.observation_space})
+  observation_preprocessor": RunningStandardScaler             # observation preprocessor class (see skrl.resources.preprocessors)
+  observation_preprocessor_kwargs": {"size": env.observation_space, "device": device}        # observation preprocessor's kwargs (e.g. {"size": env.observation_space})
   random_timesteps": 0          # random exploration steps
   learning_starts": 0           # learning starts after this many steps
   grad_norm_clip": 0            # clipping coefficient for the norm of the gradients

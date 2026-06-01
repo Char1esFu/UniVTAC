@@ -15,7 +15,7 @@ models:
     fixed_log_std: True
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [1024, 512]
         activations: relu
     output: ACTIONS
@@ -24,7 +24,7 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [1024, 512]
         activations: relu
     output: ONE
@@ -33,7 +33,7 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: STATES
+        input: OBSERVATIONS
         layers: [1024, 512]
         activations: relu
     output: ONE
@@ -66,22 +66,21 @@ agent:
   learning_epochs: 6
   mini_batches: 2
   discount_factor: 0.99
-  lambda: 0.95
+  gae_lambda: 0.95
   learning_rate: 5.0e-05
   learning_rate_scheduler: null
   learning_rate_scheduler_kwargs: null
-  state_preprocessor: RunningStandardScaler
-  state_preprocessor_kwargs: null
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
-  amp_state_preprocessor: RunningStandardScaler
-  amp_state_preprocessor_kwargs: null
+  amp_observation_preprocessor: RunningStandardScaler
+  amp_observation_preprocessor_kwargs: null
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.0
   ratio_clip: 0.2
   value_clip: 0.2
-  clip_predicted_values: True
   entropy_loss_scale: 0.0
   value_loss_scale: 2.5
   discriminator_loss_scale: 5.0
