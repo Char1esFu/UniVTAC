@@ -9,6 +9,19 @@
 
 See the [Installation Guide](./docs/Installation.md) for detailed setup instructions, including installing the environment, installing TacEx from the modified local source and setting up cuRobo for motion planning.
 
+## Optional Assets
+
+The gear-assembly USDs (`factory_gear_base.usd`, `factory_gear_small.usd`, `factory_gear_medium.usd`, `factory_gear_large.usd`) used by `scripts/visualize_gear_assembly.py` are pulled from NVIDIA's public Isaac Sim asset bucket (the same files referenced by the Isaac Lab Factory task). To (re)download them into `assets/objects/`, run:
+
+```bash
+BASE=http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/IsaacLab/Factory
+DEST=assets/objects
+mkdir -p "$DEST"
+for f in factory_gear_base factory_gear_small factory_gear_medium factory_gear_large; do
+    curl -sSL -o "$DEST/${f}.usd" "$BASE/${f}.usd"
+done
+```
+
 ## Task Gallery
 
 UniVTAC currently includes the following manipulation tasks, all featuring tactile sensing:
