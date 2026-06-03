@@ -52,12 +52,12 @@ class Policy(BasePolicy):
 
 ```bash
 bash eval_policy.sh ${task_name} ${task_config} ${policy_name}/${policy_config_name} ${gpu_id}
-# Example: bash eval_policy.sh lift_bottle demo YourPolicy/deploy 0
+# Example: TRAIN_CONFIG=univtac EP_NUM=100 bash eval_policy.sh lift_can clean ACT/deploy 0
 ```
 
 or 
 
 ```bash
 bash parallel_eval.sh ${task_name} ${task_config} ${policy_config} ${gpu_id} [num_processes] [total_num]
-# Example: bash parallel_eval.sh lift_bottle demo YourPolicy/deploy 3 0,1,2
+# Example: TRAIN_CONFIG=univtac EP_NUM=100 bash parallel_eval.sh lift_can clean ACT/deploy 0 2 100
 ```

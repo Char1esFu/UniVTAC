@@ -7,15 +7,16 @@ The pipeline iterates over random seeds, executing the scripted policy for each 
 Running the following command will start data collection for the specified task:
 
 ```bash
-bash collect_data.sh ${task_name} ${config_name} ${gpu_id}
-# Example: bash collect_data.sh lift_bottle demo 0
+bash collect_data.sh ${task_name} ${config_name} ${gpu_id} [start_seed] [max_seed] [episode_num]
+# Example: bash collect_data.sh lift_can clean 0
+# Example with explicit seed range and episode count: bash collect_data.sh lift_can clean 0 1000000 -1 100
 ```
 
 For faster collection with multiple parallel simulation workers: (Note: the parallel collection is implemented with Python's multiprocessing, so multiple Isaac Sim Apps will be launched on the same time)
 
 ```bash
 bash parallel_collect.sh ${task_name} ${config_name} ${gpu_id} [num_processes]
-# Example: bash parallel_collect.sh lift_bottle demo 0 3
+# Example: bash parallel_collect.sh lift_can clean 0 3
 ```
 
 All available `task_name` options correspond to Python modules in the `envs/` directory (e.g., `lift_bottle`, `insert_HDMI`, `pull_out_key`, `grasp_classify`, etc.). The `config_name` parameter specifies a YAML configuration file in `task_config/` (without the `.yml` extension). The `gpu_id` parameter specifies which GPU to use (multiple GPUs are supported).
