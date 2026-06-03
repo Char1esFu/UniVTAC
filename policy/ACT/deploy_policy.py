@@ -14,6 +14,18 @@ from .act_policy import ACT
 # from act_policy import ACT
 from torchvision import transforms
 
+
+def _get_tactile_rgb_marker(observation, side):
+    tactile = observation["tactile"]
+    candidates = (f"{side}_tactile", f"{side}_gsmini")
+    for name in candidates:
+        if name in tactile:
+            return tactile[name]["rgb_marker"]
+    raise KeyError(
+        f"Missing tactile observation for {side}. Expected one of {candidates}, "
+        f"got keys: {list(tactile.keys())}"
+    )
+
 class Policy(BasePolicy):
 # class Policy:
     def __init__(self, args):
@@ -84,8 +96,8 @@ class Policy(BasePolicy):
         else:
             cam_high = camera_transform(observation["observation"][self.camera_type]["rgb"])
 
-        left_tac = tactile_transform(observation["tactile"]["left_gsmini"]["rgb_marker"])
-        right_tac = tactile_transform(observation["tactile"]["right_gsmini"]["rgb_marker"])
+        left_tac = tactile_transform(_get_tactile_rgb_marker(observation, "left"))
+        right_tac = tactile_transform(_get_tactile_rgb_marker(observation, "right"))
         
         # Extract joint positions (8D: 7 arm + 1 gripper)
         qpos = observation["embodiment"]["joint"][:8]
