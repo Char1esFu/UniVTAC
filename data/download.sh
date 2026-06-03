@@ -50,6 +50,12 @@ for task_dir in "$DATA_DIR/checkpoints"/*/; do
     done
 done
 
+# Remove the downloaded checkpoint source after all checkpoint files have been
+# copied into the paths used by evaluation.
+echo "==> Cleaning downloaded checkpoint source..."
+rm -rf "$DATA_DIR/checkpoints"
+echo "    Removed $DATA_DIR/checkpoints"
+
 echo ""
 echo "Done. To evaluate with downloaded checkpoints:"
 echo "  EP_NUM=100 TRAIN_CONFIG=univtac bash eval_policy.sh <task> clean ACT/deploy_policy <gpu>"
