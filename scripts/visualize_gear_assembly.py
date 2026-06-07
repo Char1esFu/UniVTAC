@@ -29,7 +29,8 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 # WebRTC livestream (mode 2) — view in the isaacsim-webrtc-streaming-client.
 # Livestream implies headless; the local GUI window is not opened.
-args_cli.livestream = 2
+# args_cli.livestream = 2
+args_cli.headless = False
 args_cli.enable_cameras = True
 args_cli.num_envs = 1
 
@@ -143,7 +144,7 @@ GEAR_MASS = {"small": 0.019, "medium": 0.012, "large": 0.019}
 
 # Yaw (radians) of the gear-base around world +z. The base sits flat on the
 # plate, so pitch/roll are not exposed — only yaw is physically meaningful.
-BASE_YAW = 1.57
+BASE_YAW = 0.0 * np.pi
 
 
 def _gear_rigid_props(disable_gravity: bool = False) -> RigidBodyPropertiesCfg:
