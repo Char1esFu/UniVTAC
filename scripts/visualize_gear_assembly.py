@@ -93,8 +93,14 @@ GRASP_ARRIVAL_POS_TOL = 0.02
 IK_MAX_ITERS = 100
 IK_DLS_LAMBDA = 0.1
 IK_POSITION_TOL = 1e-3
-CUROBO_GRASP_TARGET_X_OFFSET = 0.02
-CUROBO_GRASP_TARGET_Z_OFFSET = 0.035
+# Grasp offsets are relative to the gear's geometry center (= root_pos_w after
+# the gears were re-centered by scripts/recenter_gears.py). X≈0 grasps the gear
+# on-center; Z lifts the grasp above the center. These were rebased from the
+# pre-re-center values (X=0.02, Z=0.035) — which compensated for root_pos_w then
+# sitting 0.02025 m behind / 0.0175 m below the true center — to keep the world
+# grasp point identical.
+CUROBO_GRASP_TARGET_X_OFFSET = 0.0
+CUROBO_GRASP_TARGET_Z_OFFSET = 0.0175
 MEDIUM_GEAR_PREP_X_OFFSET = 0.018
 MEDIUM_GEAR_PREP_Z_OFFSET = 0.07
 MEDIUM_GEAR_LOWER_Z_OFFSET = 0.03
@@ -116,17 +122,22 @@ REALSENSE_DEBUG_VIS = True
 
 
 
-# (dx, dy, dz) offset of each gear's spawn position relative to the gear-base
+# (dx, dy, dz) offset of each gear's spawn ORIGIN relative to the gear-base
 # origin. dz is added on top of the drop height defined in `design_scene()`.
-# Factory's reference peg locations are
+#
+# The gear USDs were re-centered (scripts/recenter_gears.py) so each origin now
+# sits at its own geometry center. The Factory peg offset that used to be baked
+# into the mesh vertices is therefore applied here explicitly:
 #   small=(5.075e-2, 0, 0), medium=(2.025e-2, 0, 0), large=(-3.025e-2, 0, 0)
-# (see IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/factory/
-#  factory_tasks_cfg.py:191-193) — set these here to drop each gear onto its
-# matching peg slot.
+# (Factory ref: IsaacLab .../direct/factory/factory_tasks_cfg.py:191-193).
+# dz=0.0175 lifts the origin to the geometry-center height (gear half-height
+# 0.0125 + 0.005 base inset) so the geometry lands exactly where it did before
+# re-centering. medium keeps its extra +0.15 in Y to stage it aside for the
+# pick-and-place demo.
 GEAR_BASE_OFFSETS: dict[str, tuple[float, float, float]] = {
-    "small":  (0.0, 0.0, 0.0),
-    "medium": (0.0, 0.15, 0.0),
-    "large":  (0.0, 0.0, 0.0),
+    "small":  (0.05075, 0.0, 0.0175),
+    "medium": (0.02025, 0.15, 0.0175),
+    "large":  (-0.03025, 0.0, 0.0175),
 }
 GEAR_MASS = {"small": 0.019, "medium": 0.012, "large": 0.019}
 
