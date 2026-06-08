@@ -1,3 +1,31 @@
+"""
+Offline HDF5 visualizer — no simulation required.
+
+Usage:
+  python scripts/visualize.py <task_name> <config> <seed> [options]
+
+  task_name : task folder under data/  (e.g. grasp_classify)
+  config    : config folder under data/<task_name>/  (e.g. clean)
+  seed      : integer seed, corresponds to <seed>.hdf5
+
+Data path resolution (automatic):
+  data/<task_name>/<config>/hdf5/<seed>.hdf5   ← self-collected data
+  data/<task_name>/<config>/<seed>.hdf5         ← downloaded data
+
+Tasks (--task):
+  video  (default) — render 2×2 MP4: left/right tactile + wrist/head camera
+                     output file: <task_name>_<seed>.mp4
+  frame            — print joint positions and actor poses for frame 0
+
+Options:
+  --cache   load from .cache/<seed>/*.pkl instead of HDF5
+
+Examples:
+  python scripts/visualize.py grasp_classify clean 10
+  python scripts/visualize.py grasp_classify clean 10 --task frame
+  python scripts/visualize.py grasp_classify clean 10 --cache
+"""
+
 import cv2
 import torch
 import pickle
@@ -52,7 +80,10 @@ def get_dict_data(d:dict, idx):
 def read_from_hdf5(data_root, seed):
     global data_length
 
-    data_path = Path(data_root) / 'hdf5' / f'{seed}.hdf5'
+    if (Path(data_root) / 'hdf5' / f'{seed}.hdf5').exists():
+        data_path = Path(data_root) / 'hdf5' / f'{seed}.hdf5'
+    else:
+        data_path = Path(data_root) / f'{seed}.hdf5'
     data = HDF5Handler().load_hdf5(data_path)
     
     data_length = len(data['observation']['head']['rgb'])
@@ -183,11 +214,15 @@ def print_frame(data_root, seed, frame=-1):
             frame = len(data_path) + frame
         data = pickle.load(open(data_path[frame], 'rb'))
     else:
-        data_path = Path(data_root) / 'hdf5' / f'{seed}.hdf5'
+        if (Path(data_root) / 'hdf5' / f'{seed}.hdf5').exists():
+            data_path = Path(data_root) / 'hdf5' / f'{seed}.hdf5'
+        else:
+            data_path = Path(data_root) / f'{seed}.hdf5'
         data = HDF5Handler().load_hdf5(data_path)
         data = get_dict_data(data, frame)
  
-    action = np.round(data['joint_action'].reshape(-1), 4)
+    joint_raw = data['joint_action'] if 'joint_action' in data else data['embodiment']['joint']
+    action = np.round(joint_raw.reshape(-1), 4)
     for i, k in enumerate(joint_pos.keys()):
         joint_pos[k] = action[i]
     joint_pos['panda_finger_joint1'] = max(joint_pos['panda_finger_joint1'], joint_pos['panda_finger_joint2'])
@@ -200,12 +235,14 @@ def print_frame(data_root, seed, frame=-1):
 
 def main(task, name, config, seed, is_cache):
     global data_length
-    data_root = f'./data/{config}/{name}'
+    data_root = f'./data/{name}/{config}'
     if task == 'video':
         if is_cache:
             data_list = read_from_cache(data_root, seed)
         else:
-            if not (Path(data_root) / 'hdf5' / f'{seed}.hdf5').exists():
+            hdf5_in_subdir = (Path(data_root) / 'hdf5' / f'{seed}.hdf5').exists()
+            hdf5_direct = (Path(data_root) / f'{seed}.hdf5').exists()
+            if not hdf5_in_subdir and not hdf5_direct:
                 print(f'[Warning] HDF5 file not found, try to load from cache instead.')
                 data_list = read_from_cache(data_root, seed)
             else:
@@ -213,8 +250,8 @@ def main(task, name, config, seed, is_cache):
         next(data_list) # init
         print(f'Loaded {data_length} samples from {data_root}, structure:')
         gen_video(data_list, [
-            ['tactile', 'left_tactile', 'rgb_marker'],
-            ['tactile', 'right_tactile', 'rgb_marker'],
+            ['tactile', 'left_gsmini', 'rgb_marker'],
+            ['tactile', 'right_gsmini', 'rgb_marker'],
             ['observation', 'wrist', 'rgb'],
             ['observation', 'head', 'rgb'],
         ], f'{name}_{seed}.mp4', FPS=30, COLS=2)

@@ -1,3 +1,31 @@
+"""
+Replay HDF5 trajectories inside IsaacLab simulation — requires Isaac Sim.
+
+Usage:
+  python scripts/replay.py <task_name> <task_config> [--seed N] [--gpu 0]
+
+  task_name   : env module under envs/
+                (grasp_classify | insert_HDMI | insert_hole | insert_tube |
+                 lift_bottle | lift_can | pull_out_key | put_bottle_in_shelf)
+  task_config : yml name under task_config/, or a full path to a yml/yaml file
+                (clean | contact | demo)
+  --seed N    : replay only seed N; omit to replay all seeds in the directory
+  --gpu       : CUDA device index (optional)
+
+Data path resolution (automatic):
+  data/<task_name>/<task_config>/hdf5/<seed>.hdf5  ← self-collected data
+  data/<task_name>/<task_config>/<seed>.hdf5        ← downloaded data (needs metadata.json)
+
+Outputs:
+  eval_result/replay/<task_name>/<task_config>/<timestamp>/
+  ├── log.log                    # per-seed success/failure log
+  └── replay_traj/<seed>.json    # per-step target vs. result comparison
+
+Examples:
+  python scripts/replay.py grasp_classify clean --gpu 0
+  python scripts/replay.py grasp_classify clean --seed 10 --gpu 0
+"""
+
 import sys
 
 sys.path.append(".")
@@ -33,6 +61,12 @@ parser.add_argument(
     "--gpu",
     type=str,
     default=None,
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Replay a single seed only. If not set, replay all seeds in the data directory.",
 )
 AppLauncher.add_app_launcher_args(parser)
 
@@ -206,6 +240,11 @@ def main():
             if (data_root / f'{k}.hdf5').exists() and 'seed' in v:
                 data.append((int(v['seed']), data_root / f'{k}.hdf5'))
  
+    if args_cli.seed is not None:
+        data = [(seed, path) for seed, path in data if seed == args_cli.seed]
+        if not data:
+            raise FileNotFoundError(f"Seed {args_cli.seed} not found in {data_root}.")
+
     log(f"Start replaying {len(data)} seeds from {data_root}.")
 
     results = replay_seeds(task, data=data)
