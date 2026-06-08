@@ -47,6 +47,7 @@ def create_gelsight_mini_cfg(
     resolution = (320, 240),
     update_period = 1/120,
     data_type:list[str] = ["camera_depth", "tactile_rgb"],
+    debug_vis: bool = False,
 ):
     from tacex_assets.sensors.gelsight_mini.gsmini_cfg import GelSightMiniCfg
     sensor_cfg = GelSightMiniCfg(
@@ -59,7 +60,7 @@ def create_gelsight_mini_cfg(
             clipping_range=(0.024, 0.034),
         ),
         device="cuda",
-        debug_vis=False,  # for rendering sensor output in the gui
+        debug_vis=debug_vis,  # for rendering sensor output in the gui
         update_period=1/120,
         marker_motion_sim_cfg=ManiSkillSimulatorCfg(
             tactile_img_res=resolution,
@@ -103,6 +104,7 @@ def create_gf225_cfg(
     gelpad_attachment_prim_path: str = None,
     name: str = "tactile_sensor",
     data_type: list[str] = ["camera_depth", "tactile_rgb"],
+    debug_vis: bool = False,
 ) -> TactileCfg:
     resolution = (480, 480)  # GF225 resolution
     update_period = 1/120
@@ -117,7 +119,7 @@ def create_gf225_cfg(
             clipping_range=(0.02, 0.0265),
         ),
         device="cuda",
-        debug_vis=False,
+        debug_vis=debug_vis,
         update_period=1/120,
         marker_motion_sim_cfg=ManiSkillSimulatorCfg(
             tactile_img_res=resolution,
@@ -168,6 +170,7 @@ def create_xensews_cfg(
     resolution = (320, 240),
     update_period = 1/120,
     data_type:list[str] = ["camera_depth", "tactile_rgb"],
+    debug_vis: bool = False,
 ) -> TactileCfg:
     from tacex_assets.sensors.xensews.xensews_cfg import XenseWSCfg
 
@@ -181,7 +184,7 @@ def create_xensews_cfg(
             clipping_range=(0.01, 0.03),  # (0.024, 0.034),
         ),
         device="cuda",
-        debug_vis=False,  # for rendering sensor output in the gui
+        debug_vis=debug_vis,  # for rendering sensor output in the gui
         update_period=update_period,
         marker_motion_sim_cfg=ManiSkillSimulatorCfg(
             tactile_img_res=resolution,
@@ -222,6 +225,7 @@ def create_tactile_cfg(
     name: str = "tactile_sensor",
     sensor_type:Literal['gsmini', 'xensews', 'gf225'] = "gsmini",
     data_type:list[str] = ["camera_depth", "tactile_rgb"],
+    debug_vis: bool = False,
 ) -> TactileCfg:
     if sensor_type == "gsmini":
         return create_gelsight_mini_cfg(
@@ -230,6 +234,7 @@ def create_tactile_cfg(
             gelpad_attachment_body_name=gelpad_attachment_body_name,
             name=name,
             data_type=data_type,
+            debug_vis=debug_vis,
         )
     elif sensor_type == "xensews":
         return create_xensews_cfg(
@@ -238,6 +243,7 @@ def create_tactile_cfg(
             gelpad_attachment_body_name=gelpad_attachment_body_name,
             name=name,
             data_type=data_type,
+            debug_vis=debug_vis,
         )
     elif sensor_type == "gf225":
         return create_gf225_cfg(
@@ -247,6 +253,7 @@ def create_tactile_cfg(
             gelpad_attachment_prim_path=gelpad_attachment_prim_path,
             name=name,
             data_type=data_type,
+            debug_vis=debug_vis,
         )
     else:
         raise ValueError(f"Unknown sensor type: {sensor_type}")
@@ -308,9 +315,17 @@ class VisualTactileSensor:
     
     def set_debug_vis(self):
         if not self.sensor.cfg.debug_vis:
-            return 
-        for data_type in ['marker_motion']:
-            self.sensor._prim_view.prims[0].GetAttribute(f"debug_{data_type}").Set(True)
+            return
+        # GelSightSensor._initialize_debug_vis only creates a `debug_<data_type>`
+        # USD attribute for the data types the sensor is configured to produce
+        # (camera_depth / camera_rgb / tactile_rgb / marker_motion). Enable every
+        # one that exists so the corresponding GUI window pops up, instead of the
+        # previous hard-coded marker_motion-only behaviour.
+        for prim in self.sensor._prim_view.prims:
+            for data_type in self.sensor.cfg.data_types:
+                attr = prim.GetAttribute(f"debug_{data_type}")
+                if attr:
+                    attr.Set(True)
     
     def get_observations(self, data_types: list[str] = None):
         obs = {}

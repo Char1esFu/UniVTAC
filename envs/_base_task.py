@@ -39,6 +39,7 @@ from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     euler_xyz_from_quat,
+    quat_from_euler_xyz,
     quat_error_magnitude,
     sample_uniform,
     wrap_to_pi,
@@ -75,6 +76,8 @@ from .sensors.tactile import TactileManager, TactileCfg, create_tactile_cfg
 @configclass
 class BaseTaskCfg(DirectRLEnvCfg):
     logger_level = "error"
+    # When True: draws motion-target markers AND enables each GelSight sensor's
+    # built-in tactile GUI window(s).
     debug_vis = False
 
     # viewer settings
@@ -175,9 +178,35 @@ class BaseTaskCfg(DirectRLEnvCfg):
         ),
         CameraCfg(
             name="wrist",
-            prim_path="/World/envs/env_.*/Robot/WristCamera/Camera",
+            # Spawn a fresh camera as a child of the panda_hand link instead of
+            # reusing the one baked into the robot USD (which was rigidly pinned
+            # to panda_hand via a FixedJoint). The mount is now fully tunable
+            # here via `offset`. Defaults below reproduce the baked camera:
+            #   - pos/rot: pose of the USD `WristCamera/Camera` prim expressed in
+            #     the panda_hand frame. Read these straight from the USD with
+            #     `python inspect_wrist_camera.py` (the "cam-in-hand" block).
+            #   - intrinsics: identical to the baked camera (== the head camera).
+            #
+            # NOTE on convention: the value read from USD is in the OpenGL/USD
+            # camera convention (-Z forward, +Y up, +X right) -> opengl quat
+            # (w,x,y,z) = (0.0, 0.703091, 0.711100, 0.0). We pass it in the ROS
+            # convention instead; the equivalent ROS quat is just that opengl
+            # quat rotated 180 deg about local X (swaps to (w,x,y,z) =
+            # (0.703091, 0.0, 0.0, 0.711100) for this pose). pos is the same in
+            # both conventions. Both describe the exact same physical camera.
+            prim_path="/World/envs/env_.*/Robot/panda_hand/WristCamera",
+            offset=CameraCfg.OffsetCfg(
+                pos=(0.042818, 0.0, 0.062735),
+                # rot=tuple(quat_from_euler_xyz(
+                #     torch.tensor([0.0]), torch.tensor([-0.3]), torch.tensor([np.pi])
+                # )[0].tolist()),  # wxyz
+                rot=(0.6994450614237633, -0.10562663504969942, -0.10571078187807803, 0.6988882962338909), # wxyz
+                convention="ros",
+            ),
             data_types=["rgb", "depth"],
-            spawn=None, # use existing camera
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688, clipping_range=(0.01, 100.0)
+            ),
             width=480,
             height=270,
             update_period=1/120,
@@ -246,16 +275,17 @@ class BaseTask(UipcRLEnv):
         self._camera_manager.setup()
         self._tactile_manager.setup()
         self._tactile_manager.set_debug_vis(self.cfg.debug_vis)
+        self._camera_manager.set_debug_vis(self.cfg.debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
     
     def load_robot_and_sensors(self, cfg:BaseTaskCfg):
         data_type = ["camera_depth", "tactile_rgb", "marker_rgb", "marker_motion"]
         if cfg.tactile_sensor_type == 'gsmini':
-            cfg.robot = create_franka_gsmini_gripper(data_type=data_type)
+            cfg.robot = create_franka_gsmini_gripper(data_type=data_type, debug_vis=cfg.debug_vis)
         elif cfg.tactile_sensor_type == 'gf225':
-            cfg.robot = create_franka_gf225_gripper(data_type=data_type)
+            cfg.robot = create_franka_gf225_gripper(data_type=data_type, debug_vis=cfg.debug_vis)
         elif cfg.tactile_sensor_type == 'xensews':
-            cfg.robot = create_franka_xensews_gripper(data_type=data_type)
+            cfg.robot = create_franka_xensews_gripper(data_type=data_type, debug_vis=cfg.debug_vis)
         else:
             raise ValueError(f'Unknown tactile sensor type: {cfg.tactile_sensor_type}')
         
@@ -473,7 +503,7 @@ class BaseTask(UipcRLEnv):
         self.scene.update(dt=dt)
         self._actor_manager.update(dt=dt)
         self._tactile_manager.update(dt=dt, force_recompute=True)
- 
+        self._camera_manager.update_debug_vis()
         self.last_render = self.step_count
     
     def get_frame_shot(self, obs):
@@ -705,6 +735,16 @@ class BaseTask(UipcRLEnv):
                 "gripper": None,
             }
             if action.action == 'move' or action.action == 'all':
+                # Always report (independent of debug_vis) which arm link the
+                # motion planner uses as its reference frame and the world-space
+                # target it is being moved to. curobo's ee_link == hand_name.
+                ref_link = self._robot_manager.hand_name
+                tp = action.target_pose
+                print(
+                    f"[move:{tag}#{self.atom_id}] reference link '{ref_link}' "
+                    f"-> world pos ({tp.p[0]:.4f}, {tp.p[1]:.4f}, {tp.p[2]:.4f}) m, "
+                    f"quat_wxyz ({tp.q[0]:.4f}, {tp.q[1]:.4f}, {tp.q[2]:.4f}, {tp.q[3]:.4f})"
+                )
                 action.args['constraint_pose'] = action.args.get(
                     'constraint_pose', constraint_pose)
                 action.args['time_dilation_factor'] = action.args.get(
