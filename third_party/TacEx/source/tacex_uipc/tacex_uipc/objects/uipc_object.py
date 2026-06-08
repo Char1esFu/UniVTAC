@@ -176,6 +176,37 @@ class UipcObject(AssetBase):
                 )
                 replace_color = True
 
+                # Cache tet data into the *source* USD file so subsequent runs skip float-tetwild.
+                # Isaac Sim loads USDs into an anonymous in-memory stage, so we must open the
+                # original file path directly with pxr rather than saving the runtime stage.
+                try:
+                    import pathlib
+                    from pxr import Usd, Sdf  # UsdGeom already imported at module level
+                    _src_path = getattr(getattr(self.cfg, 'spawn', None), 'usd_path', None) \
+                                or getattr(self.cfg, 'asset', None)
+                    if _src_path and pathlib.Path(str(_src_path)).is_file():
+                        _src_stage = Usd.Stage.Open(str(_src_path))
+                        _src_mesh = next(
+                            (p for p in _src_stage.Traverse() if p.IsA(UsdGeom.Mesh)), None
+                        )
+                        if _src_mesh is not None:
+                            _src_mesh.CreateAttribute(
+                                "tet_points", Sdf.ValueTypeNames.Vector3fArray).Set(tet_points)
+                            _src_mesh.CreateAttribute(
+                                "tet_indices", Sdf.ValueTypeNames.UIntArray).Set(tet_indices)
+                            _src_mesh.CreateAttribute(
+                                "tet_surf_points", Sdf.ValueTypeNames.Vector3fArray).Set(surf_points)
+                            _src_mesh.CreateAttribute(
+                                "tet_surf_indices", Sdf.ValueTypeNames.UIntArray).Set(tet_surf_indices)
+                            _src_stage.GetRootLayer().Save()
+                            omni.log.info(f"Saved tet cache → {_src_path}")
+                        else:
+                            omni.log.warn(f"No mesh prim in {_src_path}; tet cache not saved")
+                    else:
+                        omni.log.warn(f"Source USD not found ({_src_path}); tet cache not saved")
+                except Exception as _e:
+                    omni.log.warn(f"Could not save tet cache ({_e}); will re-generate next run")
+
             # transform local tet points to world coor
             tf_world = omni.usd.get_world_transform_matrix(usd_mesh)
 
