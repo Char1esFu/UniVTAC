@@ -10,7 +10,8 @@ Examples:
     # show one task, seeds 0..4, with a local GUI window
     python scripts/visualize_task.py lift_can
 
-    # specific seeds, slower playback, and draw a box at each motion target
+    # specific seeds, slower playback; --debug_vis draws a box at each motion
+    # target AND opens live windows for each GelSight sensor and each camera
     python scripts/visualize_task.py insert_hole --seeds 0 1 2 --debug_vis
 
     # loop forever over a seed range until you close the window
@@ -37,7 +38,9 @@ parser.add_argument("--sensor_type", type=str, default='gsmini', choices=['gsmin
 parser.add_argument("--render_frequency", type=int, default=1,
                     help="Render every N sim steps. 1 = smoothest GUI (default), higher = faster but choppier.")
 parser.add_argument("--debug_vis", action="store_true",
-                    help="Draw a red box at each motion-planning target pose (helps verify targets).")
+                    help="Draw a red box at each motion-planning target pose AND open live GUI "
+                         "windows: one tactile image per GelSight sensor and one RGB per camera "
+                         "(head, wrist).")
 parser.add_argument("--loop", action="store_true",
                     help="Keep cycling through the seeds until the window is closed.")
 parser.add_argument("--hold", type=float, default=1.0,
@@ -52,7 +55,8 @@ from isaaclab.app import AppLauncher
 AppLauncher.add_app_launcher_args(parser)
 
 # --- force a local GUI window, no data, cameras enabled (tactile/camera managers need them) ---
-args_cli.headless = False      # GUI window (livestream is intentionally NOT used)
+args_cli.headless = False      # GUI window
+# args_cli.livestream = 2 # Streaming
 args_cli.enable_cameras = True
 args_cli.num_envs = 1
 
