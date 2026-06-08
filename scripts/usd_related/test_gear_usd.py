@@ -6,7 +6,7 @@ Kit app first (same pattern as scripts/visualize_gear_assembly.py) so that the
 Isaac-shipped `pxr` modules are on sys.path before we import them.
 
 Usage:
-    python test_usd.py
+    python scripts/usd_related/test_gear_usd.py
 """
 
 from isaaclab.app import AppLauncher

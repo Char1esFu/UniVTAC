@@ -9,7 +9,7 @@ first run and re-exec once; the second pass puts the built-in ``pxr`` on
 ``sys.path`` and imports it directly.
 
 Usage:
-    python test_usd.py
+    python scripts/usd_related/read_gear_usd.py
 """
 
 import glob

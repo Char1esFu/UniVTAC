@@ -14,8 +14,8 @@ is already the origin and the gear-offset math is anchored to it).
 Originals are backed up to assets/objects/orig_backup/ before editing.
 
 Usage:
-    python scripts/recenter_gears.py            # apply (with backup)
-    python scripts/recenter_gears.py --dry-run  # report only, no writes
+    python scripts/usd_related/recenter_gears.py            # apply (with backup)
+    python scripts/usd_related/recenter_gears.py --dry-run  # report only, no writes
 """
 
 import argparse
@@ -116,6 +116,16 @@ def main() -> None:
 
     for g in GEARS:
         recenter(os.path.join(OBJECTS_DIR, g), args.dry_run)
+
+    if args.dry_run and os.path.isdir(BACKUP_DIR):
+        print(f"\n{'='*60}")
+        print(f"orig_backup ({BACKUP_DIR}):")
+        for g in GEARS:
+            backup_path = os.path.join(BACKUP_DIR, g)
+            if os.path.exists(backup_path):
+                recenter(backup_path, dry_run=True)
+            else:
+                print(f"\n{g}: no backup found")
 
 
 if __name__ == "__main__":
