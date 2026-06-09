@@ -24,7 +24,9 @@
     "NVIDIA_VISIBLE_DEVICES": "all",
     "NVIDIA_DRIVER_CAPABILITIES": "all",
     "ACCEPT_EULA": "Y",
-    "OMNI_KIT_ACCEPT_EULA": "YES"
+    "OMNI_KIT_ACCEPT_EULA": "YES",
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "XAUTHORITY": "/tmp/.Xauthority"
   },
 
   // Keep the in-container path identical to the host path.
@@ -38,7 +40,9 @@
   "mounts": [
     "source=univtac-miniforge,target=/home/${localEnv:USER}/miniforge3,type=volume",
     "source=univtac-deps,target=/home/${localEnv:USER}/deps,type=volume",
-    "source=univtac-cache,target=/home/${localEnv:USER}/.cache,type=volume"
+    "source=univtac-cache,target=/home/${localEnv:USER}/.cache,type=volume",
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=${localEnv:XAUTHORITY},target=/tmp/.Xauthority,type=bind,readonly"
   ],
 
   "remoteUser": "${localEnv:USER}",

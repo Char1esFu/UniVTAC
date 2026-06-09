@@ -89,3 +89,10 @@ Below is the structure of the saved observation data for each episode (stored in
     }
 }
 ```
+
+## Notics
+if table's texture cannot be loaded, clear the cache and run visualization script once more.
+```bash
+rm -rf ~/.cache/ov ~/.nv/ComputeCache
+python scripts/visualize_task.py gear_assembly --seeds 0 1 2 --debug_vis
+```

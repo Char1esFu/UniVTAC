@@ -44,6 +44,7 @@ RUN printf '%s\n' \
       '' \
       '# --- UniVTAC devcontainer shell init ---' \
       '[ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ] && source "$HOME/miniforge3/etc/profile.d/conda.sh"' \
+      '[ -x "$HOME/miniforge3/bin/mamba" ] && export MAMBA_EXE="$HOME/miniforge3/bin/mamba"' \
       '[ -f "$HOME/miniforge3/etc/profile.d/mamba.sh" ] && source "$HOME/miniforge3/etc/profile.d/mamba.sh"' \
       >> /home/${USERNAME}/.bashrc
 
