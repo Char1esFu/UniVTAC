@@ -69,6 +69,12 @@ class CuroboPlanner:
         self.usd_helper = UsdHelper()
         self.usd_helper.load_stage(self.task.scene.stage)
 
+        # Actors excluded from the collision world, by name. A grasped actor
+        # must be added here: it moves with the hand, so as an obstacle it
+        # makes every start state "in collision" — plans either fail outright
+        # or bow sideways trying to dodge the object the robot is holding.
+        self.ignore_actors: set[str] = set()
+
         motion_gen_config = MotionGenConfig.load_from_robot_config(
             robot_cfg=yml_data,
             world_model=self.get_curr_world_cfg(),
@@ -84,6 +90,7 @@ class CuroboPlanner:
     
     def reset(self):
         self.motion_gen.reset()
+        self.ignore_actors.clear()
 
     def get_curr_world_cfg(self):
         obstacles = self.usd_helper.get_obstacles_from_stage(
@@ -94,6 +101,8 @@ class CuroboPlanner:
         ).get_collision_check_world()
 
         for name, actor in self.task._actor_manager.actors.items():
+            if name in self.ignore_actors:
+                continue
             mesh = Mesh.from_pointcloud(actor.vertices, pitch=0.005, name=name)
             obstacles.add_obstacle(mesh)
         return obstacles

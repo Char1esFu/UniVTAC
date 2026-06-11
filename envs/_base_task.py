@@ -756,7 +756,10 @@ class BaseTask(UipcRLEnv):
                     time_dilation_factor=action.args['time_dilation_factor'],
                 )
                 if control_seq['arm']['status'] == 'Fail':
-                    self.logger.error(f'Arm motion planning failed on action {idx}: {action.__str__()}')
+                    self.logger.error(
+                        f'Arm motion planning failed on action {idx}: {action.__str__()} '
+                        f'reason: {control_seq["arm"].get("reason", "unknown")}'
+                    )
                     if self.cfg.debug_vis:
                         add_visual_box(action.target_pose, 'failed_target')
                         self.delay(100)

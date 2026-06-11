@@ -168,7 +168,10 @@ class RobotManager:
                 'velocity': result.interpolated_plan.velocity.detach()
             }
         else:
-            return {'status': 'Fail', 'num_steps': 0, 'position': None, 'velocity': None}
+            return {
+                'status': 'Fail', 'num_steps': 0, 'position': None, 'velocity': None,
+                'reason': f'{result.status} (valid_query={result.valid_query})',
+            }
 
     def gripper_percent2qpos(self, percentage:float):
         gripper_range = [0, self.gripper_max_qpos]
