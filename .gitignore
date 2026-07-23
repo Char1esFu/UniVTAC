@@ -32,6 +32,7 @@ __tracked_surface.stl
 /third_party/libuipc-samples
 
 /policy/VTLA/LLama*
+/policy/ACT/act_ckpt
 /policy/act_data/**
 /policy/ACT_Predict/**/*.ckpt
 /assets/objects/ipt/*
