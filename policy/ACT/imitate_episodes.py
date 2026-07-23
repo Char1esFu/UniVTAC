@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 from copy import deepcopy
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from utils import load_data  # data functions
 from utils import compute_dict_mean, set_seed, detach_dict  # helper functions
@@ -155,6 +156,9 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
+    # Keep TensorBoard logs together with checkpoints, so different experiments can be compared by train_config
+    writer = SummaryWriter(os.path.join(ckpt_dir, "tb"))
+
     train_history = []
     validation_history = []
     min_val_loss = np.inf
@@ -173,12 +177,26 @@ def train_bc(train_dataloader, val_dataloader, config):
             # backward
             loss = forward_dict["loss"]
             loss.backward()
+            # Record gradient norm (before step) to monitor training stability
+            grad_norm = torch.norm(torch.stack([
+                p.grad.detach().norm(2) for p in policy.parameters() if p.grad is not None
+            ]), 2)
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
 
             pbar.set_postfix({'epoch': epoch, 'loss': loss.item()})
             pbar.update(1)
+
+            for k, v in train_history[-1].items():
+                writer.add_scalar(f"train/{k}", v.item(), step_count)
+            writer.add_scalar("train/grad_norm", grad_norm.item(), step_count)
+            # Record learning rate per group: main / vision backbone / tactile backbone
+            group_names = ["lr/main", "lr/vision_backbone", "lr/tactile_backbone"]
+            for gi, pg in enumerate(optimizer.param_groups):
+                name = group_names[gi] if gi < len(group_names) else f"lr/group_{gi}"
+                writer.add_scalar(name, pg["lr"], step_count)
+            writer.add_scalar("epoch", epoch, step_count)
 
             step_count += 1
             if step_count > num_steps:
@@ -214,6 +232,10 @@ def train_bc(train_dataloader, val_dataloader, config):
         eval_summary_string = ""
         for k, v in epoch_summary.items():
             eval_summary_string += f"{k}: {v.item():.3f} "
+            writer.add_scalar(f"val/{k}", v.item(), step_count)
+
+        tqdm.write(f"[epoch {epoch:>4} | step {step_count:>5}] "
+                   f"train: {train_summary_string.strip()} | val: {eval_summary_string.strip()}")
 
         if step_count > num_steps:
             break
@@ -226,6 +248,8 @@ def train_bc(train_dataloader, val_dataloader, config):
     ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{best_epoch}_seed_{seed}.ckpt")
     torch.save(best_state_dict, ckpt_path)
     print(f"Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}")
+
+    writer.close()
 
     # save training curves
     plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
