@@ -4,9 +4,11 @@
         "/opt/ros/humble/lib/python3.10/site-packages",
         "/opt/ros/humble/local/lib/python3.10/dist-packages"
     ],
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.defaultInterpreterPath": "${env:HOME}/miniforge3/envs/UniVTAC/bin/python",
+    // local:
+    // "python.defaultInterpreterPath": "${env:HOME}/miniforge3/envs/UniVTAC/bin/python",
+    // cluster:
+    "python.defaultInterpreterPath": "${env:WORK}/software/private/conda/envs/UniVTAC/bin/python",
     "python.analysis.extraPaths": [
         "${env:HOME}/Projects/IsaacLab/source/isaaclab",
         // "${env:HOME}/Projects/IsaacLab/source/isaaclab_assets",
@@ -24,5 +26,6 @@
     "python.analysis.diagnosticSeverityOverrides": {
         "reportMissingModuleSource": "none",
         "reportMissingImports": "none"
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda"
 }
