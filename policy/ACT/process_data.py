@@ -22,14 +22,13 @@ def load_hdf5(dataset_paths, camera_type, downsample_factor):
     else:
         data_paths.append(f'observation/{camera_type}/rgb')    
     
+    # Tactile sensor group names are inconsistent across data batches, probe using the first file
     with h5py.File(str(dataset_paths[0]), 'r') as f:
-        try:
-            f['tactile/left_tactile/rgb_marker']
-            data_paths.append('tactile/left_tactile/rgb_marker')
-            data_paths.append('tactile/right_tactile/rgb_marker')
-        except:
-            data_paths.append('tactile/left_gsmini/rgb_marker')
-            data_paths.append('tactile/right_gsmini/rgb_marker')
+        if 'tactile/left_tactile/rgb_marker' in f:
+            tac_keys = ('tactile/left_tactile/rgb_marker', 'tactile/right_tactile/rgb_marker')
+        else:
+            tac_keys = ('tactile/left_gsmini/rgb_marker', 'tactile/right_gsmini/rgb_marker')
+    data_paths.extend(tac_keys)
 
     data = HDF5Handler().batch_gather_hdf5(
         dataset_paths,
@@ -38,8 +37,8 @@ def load_hdf5(dataset_paths, camera_type, downsample_factor):
         convert_channels=False,
         downsample_factor=downsample_factor,
     )
- 
-    return data
+
+    return data, tac_keys
 
 
 def data_transform(path, episode_num, save_path):
@@ -50,7 +49,7 @@ def data_transform(path, episode_num, save_path):
             print(f"HDF5 directory does not exist at \n{hdf5_dir}\n")
             raise FileNotFoundError(f"HDF5 directory not found: {hdf5_dir}")
     
-    # 获取所有 episode 文件
+    # Get all episode files
     hdf5_files = sorted(hdf5_dir.glob('*.hdf5'), key=lambda x: int(x.stem))
     assert episode_num <= len(hdf5_files), f"data num not enough: requested {episode_num}, found {len(hdf5_files)}"
 
@@ -65,11 +64,11 @@ def data_transform(path, episode_num, save_path):
     downsample_factor = task_settings[task_name].get('downsample', 1)
     print(f"Loading {episode_num} episodes with camera type '{camera_type}', downsample factor {downsample_factor}.")
 
-    # 批量加载所有 episode
+    # Batch load all episodes
     dataset_paths = [str(hdf5_files[i]) for i in range(episode_num)]
-    data = load_hdf5(dataset_paths[:episode_num], camera_type, downsample_factor)
+    data, tac_keys = load_hdf5(dataset_paths[:episode_num], camera_type, downsample_factor)
     
-    # 提取批量数据
+    # Extract batched data
     joint_state_all = data['embodiment/joint_state'][:, 0:8]  # (T_total, 8)
     joint_action_all = data['embodiment/joint_action'][:, 0:8]  # (T_total, 8)
     if camera_type == 'all':
@@ -77,8 +76,8 @@ def data_transform(path, episode_num, save_path):
         wrist_cam_all = data[f'observation/wrist/rgb']  # (T_total, H, W, 3)
     else:
         head_cam_all = data[f'observation/{camera_type}/rgb']  # (T_total, H, W, 3)
-    left_tac_all = data['tactile/left_tactile/rgb_marker']  # (T_total, H, W, 3)
-    right_tac_all = data['tactile/right_tactile/rgb_marker']  # (T_total, H, W, 3)
+    left_tac_all = data[tac_keys[0]]  # (T_total, H, W, 3)
+    right_tac_all = data[tac_keys[1]]  # (T_total, H, W, 3)
     episode_ends = data['episode_ends']
     
     start_idx = 0
@@ -95,14 +94,14 @@ def data_transform(path, episode_num, save_path):
         left_tac = left_tac_all[start_idx:end_idx]
         right_tac = right_tac_all[start_idx:end_idx]
 
-        # 保存为 ACT 格式的 HDF5
+        # Save as ACT-format HDF5
         hdf5path = os.path.join(save_path, f"episode_{i}.hdf5")
         with h5py.File(hdf5path, "w") as f:
             f.create_dataset("action", data=np.array(joint_action))
             obs = f.create_group("observations")
             obs.create_dataset("qpos", data=np.array(joint_state))
             image = obs.create_group("images")
-            # 只保存头部相机和触觉传感器
+            # Only save head camera and tactile sensors
             if camera_type == 'all':
                 image.create_dataset("cam_high", data=np.stack(head_cam), dtype=np.uint8)
                 image.create_dataset("cam_wrist", data=np.stack(wrist_cam), dtype=np.uint8)

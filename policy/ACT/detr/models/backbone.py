@@ -94,10 +94,13 @@ class Backbone(BackboneBase):
     """ResNet backbone with frozen BatchNorm."""
 
     def __init__(self, name: str, train_backbone: bool, return_interm_layers: bool, dilation: bool):
+        # torchvision >= 0.13 uses weights= instead of pretrained=; IMAGENET1K_V1 is the same
+        # weights that pretrained=True used to load, behavior unchanged
+        weights = 'IMAGENET1K_V1' if is_main_process() else None
         backbone = getattr(torchvision.models,
                            name)(replace_stride_with_dilation=[False, False, dilation],
-                                 pretrained=is_main_process(),
-                                 norm_layer=FrozenBatchNorm2d)  # pretrained # TODO do we want frozen batch_norm??
+                                 weights=weights,
+                                 norm_layer=FrozenBatchNorm2d)  # TODO do we want frozen batch_norm??
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
