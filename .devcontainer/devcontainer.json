@@ -1,21 +1,19 @@
 {
-  "name": "UniVTAC (CUDA 12.6 / Isaac Sim 4.5)",
+  "name": "UniVTAC (Isaac Sim 4.5 / Isaac Lab 2.1.1)",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
       "USERNAME": "${localEnv:USER}",
-      // UID/GID default to 1000 (standard for the first user on most Linux distros).
-      // If your host UID differs, VS Code adjusts it automatically via updateRemoteUserUID.
+      // Remapped to the host uid at start by updateRemoteUserUID.
       "USER_UID": "1000",
       "USER_GID": "1000"
     }
   },
 
-  // GPU passthrough + relaxed confinement — the devcontainer equivalent of the
-  // distrobox `--additional-flags`. Requires the host docker to have the
-  // NVIDIA Container Toolkit CDI spec configured (it already works for distrobox).
+  // GPU passthrough needs the NVIDIA Container Toolkit CDI spec on the host.
   "runArgs": [
     "--device", "nvidia.com/gpu=all",
+    "--shm-size=16g",
     "--security-opt", "seccomp=unconfined",
     "--security-opt", "apparmor=unconfined"
   ],
@@ -29,14 +27,7 @@
     "XAUTHORITY": "/tmp/.Xauthority"
   },
 
-  // Keep the in-container path identical to the host path.
-  "workspaceMount": "source=${localWorkspaceFolder},target=/home/${localEnv:USER}/Projects/UniVTAC,type=bind",
-  "workspaceFolder": "/home/${localEnv:USER}/Projects/UniVTAC",
-
-  // Persist the heavy bits across container rebuilds:
-  //   miniforge -> the conda base + UniVTAC env (tens of GB)
-  //   deps      -> IsaacLab, curobo, vcpkg (editable installs point here)
-  //   cache     -> pip / HuggingFace / Omniverse caches
+  // Persisted across rebuilds: conda env, IsaacLab/curobo/vcpkg, caches.
   "mounts": [
     "source=univtac-miniforge,target=/home/${localEnv:USER}/miniforge3,type=volume",
     "source=univtac-deps,target=/home/${localEnv:USER}/deps,type=volume",
@@ -50,18 +41,14 @@
   // Remap the container user's UID to match the host if they differ.
   "updateRemoteUserUID": true,
 
-  // Run Claude Code (and Python tooling) *inside* the container, against the
-  // container's filesystem. The Claude Code extension ships a native binary,
-  // so no Node is needed.
   "customizations": {
     "vscode": {
       "extensions": [
-        "anthropic.claude-code",
         "ms-python.python"
       ],
-      // Override host settings: packages are all pip-installed, so let VSCode
-      // treat the conda env as a plain system env rather than trying to manage it.
+      // Everything is pip-installed, so treat the conda env as a plain system env.
       "settings": {
+        "python.defaultInterpreterPath": "${env:HOME}/miniforge3/envs/UniVTAC/bin/python",
         "python-envs.defaultEnvManager": "ms-python.python:system",
         "python-envs.defaultPackageManager": "ms-python.python:pip",
         "python.analysis.extraPaths": [
@@ -75,7 +62,7 @@
     }
   },
 
-  // Named volumes are created root-owned; hand them to the user once. This is
-  // the only thing run automatically — the heavy env build stays manual.
-  "postCreateCommand": "sudo chown $USER:$USER $HOME/miniforge3 $HOME/deps $HOME/.cache && echo 'Container ready. Run:  bash .devcontainer/setup-univtac-env.sh'"
+  // Volumes are created root-owned; hand them over, then build the env.
+  "postCreateCommand": "sudo chown $(id -un):$(id -gn) $HOME/miniforge3 $HOME/deps $HOME/.cache && bash .devcontainer/setup-univtac-env.sh",
+  "waitFor": "postCreateCommand"
 }

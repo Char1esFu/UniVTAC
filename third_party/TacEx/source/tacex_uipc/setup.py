@@ -73,6 +73,9 @@ class CMakeBuild(build_ext):
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir,
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=1",
             "-DCMAKE_COLOR_DIAGNOSTICS=1",
+            # Point at the tinygltf port only. The urdfdom and urdfdom-headers overlays are 
+            # EMPTY_PACKAGE stubs that assume urdfdom is already installed system-wide.
+            "-DVCPKG_OVERLAY_PORTS=" + os.path.join(EXTENSION_PATH, "overlay-ports", "tinygltf"),
             "-DUIPC_BUILD_PYBIND=" + self.DUIPC_BUILD_PYBIND,  # per default = 1, i.e. true
             "-DUIPC_DEV_MODE=1",
             "-DUIPC_BUILD_GUI=0",

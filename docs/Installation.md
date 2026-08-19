@@ -42,7 +42,6 @@ pip install 'isaacsim[all,extscache]==4.5.0' --extra-index-url https://pypi.nvid
 # manually install flatdict
 pip install "setuptools<81" wheel
 pip install --no-build-isolation flatdict==4.0.1
-pip install "setuptools==82.0.1"
 
 pip install transforms3d
 ```
@@ -60,8 +59,9 @@ cd IsaacLab
 git fetch --tags
 git checkout v2.1.1
 
-# install isaaclab extensions (with --editable flag)
-./isaaclab.sh --install # or "./isaaclab.sh -i"
+# pin stable baselines 3 version to avoid torch upgrade 
+pip install "stable-baselines3==2.7.0"
+./isaaclab.sh -i
 ```
 
 To verify the Isaac Lab Installation:
