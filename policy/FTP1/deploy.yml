@@ -1,0 +1,35 @@
+# FTP-1 deployment config.
+#
+# The model runs in a separate process: start policy/FTP1/ftp1_server.py with the
+# ftp1-policy uv env first (see the docstring there). This file only configures the
+# client inside the Isaac Sim evaluation loop.
+
+policy_name: FTP1
+seed: 0
+instruction_type: seen
+instuction_file: null   # prompt comes from the training instructions, see `instruction`
+
+# --- inference server ---------------------------------------------------------
+# Overridable at runtime with FTP1_SERVER.
+server_url: http://127.0.0.1:5002
+request_timeout: 60.0     # seconds per /infer
+load_timeout: 600.0       # seconds for /load (8 GB of weights on a cold start)
+
+# --- checkpoint ---------------------------------------------------------------
+# null: the server picks the ftp1_univtac_finetune release checkpoint for the task
+# (insert_hole, insert_tube, lift_bottle, lift_can, pull_out_key, put_bottle_in_shelf)
+# and reads domain_name from its normalization/ folder. Set both to evaluate your
+# own checkpoint, e.g. a step directory produced by scripts/zarr_train_ftp1_pytorch.py.
+checkpoint_dir: null
+domain_name: null
+
+# --- inputs -------------------------------------------------------------------
+# null: use the training prompt from parse_data_univtac.py for this task.
+instruction: null
+# null: wrist camera only for lift_can / insert_tube, as in training.
+use_wrist: null
+
+# --- action execution (eval_ftp1.sh defaults) ---------------------------------
+# Re-infer every step and blend the overlapping predictions.
+chunk_first_n: 20         # only the first N executable steps of each chunk vote
+ensemble_K: 0.01          # weights exp(-K * i), oldest chunk first
