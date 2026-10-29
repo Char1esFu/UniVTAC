@@ -144,7 +144,8 @@ class ACT:
                 self.stats = None
 
             # Load policy weights
-            ckpt_path = os.path.join(ckpt_dir, "policy_last.ckpt")
+            ckpt_name = os.environ.get("CKPT_NAME") or "policy_last.ckpt"
+            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             print("current pwd:", os.getcwd())
             if os.path.exists(ckpt_path):
                 loading_status = self.policy.load_state_dict(torch.load(ckpt_path))
