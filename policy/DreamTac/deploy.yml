@@ -1,0 +1,67 @@
+# Dream-Tac (Cosmos-Policy 2B video2world) deployment config.
+#
+# The model itself runs in a separate process -- see README.md. This file only
+# configures the client that lives inside the Isaac Sim evaluation loop.
+
+policy_name: DreamTac
+seed: 0
+instruction_type: seen
+instuction_file: null
+
+# --- inference server ---------------------------------------------------------
+# franka_server.py listens on :5001. Point this at a local server, or at the
+# local end of an `ssh -L 5001:<node>:5001 alex` tunnel to a cluster job.
+# Overridable at runtime with DREAMTAC_SERVER.
+server_url: http://127.0.0.1:5001
+request_timeout: 120.0      # seconds; a cold first request also pays CUDA warmup
+health_check: true          # fail fast at init instead of at the first step
+
+# --- text conditioning --------------------------------------------------------
+# Must match a key in the server's t5_embeddings.pkl. The cache was built from
+# UniVTAC folder names via `task.replace("_", " ")`, so leaving this null derives
+# e.g. insert_hole -> "insert hole". Do NOT use task.instruction: with
+# instuction_file: null that string is "Empty", which has no embedding.
+instruction: null
+
+# --- action chunk execution ---------------------------------------------------
+# The model returns chunk_size actions per query. actions_per_chunk is how many
+# of them we actually execute before re-querying; null means all of them.
+# The paper quotes 5 Hz at 1109 ms/query, which only reconciles with H=20 if a
+# partial chunk is executed -- try 5..8 here if full-chunk replay drifts.
+actions_per_chunk: null
+
+# Low-pass each returned chunk with [1,2,1]/4 before executing it. The
+# insert_hole iter_000004000 checkpoint superimposes a fixed period-2 zigzag
+# (1-1.7 mm in x) on the trajectory, which makes the arm shake; this filter
+# removes exactly that component. See _smooth_chunk in deploy_policy.py.
+smooth_actions: true
+
+# Each chunk also carries its own pose offset, so the arm jumps at every chunk
+# boundary. Fold the gap between the current pose and the chunk's first action
+# out linearly over this many actions (later targets unchanged). 0 disables.
+blend_steps: 10
+
+# Data was recorded every save_frequency (=2) sim steps, so one recorded
+# transition ee[t] -> ee[t+1] spans 2 sim steps. take_action() advances 1. Hold
+# each commanded pose for this many steps to restore the training timebase.
+sim_steps_per_action: 2
+
+# --- IK servo -----------------------------------------------------------------
+# The model emits absolute EE poses; we solve IK ourselves and drive the arm
+# through the ordinary qpos path, so envs/ needs no changes.
+ik:
+  num_seeds: 20
+  position_threshold: 0.001   # m,   matches CuroboPlanner
+  # Tighter than CuroboPlanner's 0.01: across all 100 insert_hole demos roll
+  # spans only 6.7 mrad (3.1391..3.1458) and a whole episode rotates ~3 mrad
+  # (median), so a 10 mrad acceptance could push the next proprio far outside
+  # its normalisation range. Failed solves hold pose and are counted per episode.
+  rotation_threshold: 0.001   # rad
+  self_collision_check: true  # self-collision only; the world is deliberately
+                              # excluded so contact with the manipulated object
+                              # cannot make every solve fail
+  use_cuda_graph: true
+
+# --- debugging ----------------------------------------------------------------
+save_frame_every: 10        # 0 disables the periodic annotated screenshot
+log_actions: false          # dump every requested chunk to eval_result/.../chunks.jsonl
