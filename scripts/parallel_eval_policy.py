@@ -240,7 +240,17 @@ def main():
 
     # Base save dir with unified date
     curr_time = time.strftime(r'%Y-%m-%d_%H:%M:%S')
-    base_save_dir = Path('eval_result') / policy_name / args.task_name / deploy_config_file.stem / curr_time
+    # Same naming as eval_policy.get_run_tag; a policy that knows its own
+    # weights better than TRAIN_CONFIG does (DreamTac) supplies the tag.
+    policy_module = importlib.import_module(f"policy.{policy_name}")
+    if hasattr(policy_module, 'get_run_tag'):
+        run_tag = policy_module.get_run_tag(deploy_config)
+    else:
+        run_tag = os.environ.get('TRAIN_CONFIG') or 'train_config'
+        ckpt_name = os.environ.get('CKPT_NAME') or 'policy_last.ckpt'
+        if ckpt_name != 'policy_last.ckpt':
+            run_tag = f"{run_tag}-{Path(ckpt_name).stem}"
+    base_save_dir = Path('eval_result') / policy_name / args.task_name / deploy_config_file.stem / run_tag / curr_time
     base_save_dir.mkdir(parents=True, exist_ok=True)
     out_log = base_save_dir / 'out.log'
     clean_log = base_save_dir / 'log.log'

@@ -189,6 +189,24 @@ def get_config(file, default_root:Path, type:Literal['yaml', 'json']):
             config = json.load(f)
         return config, file
 
+def get_run_tag(policy_module, deploy_config):
+    """Identify the weights under eval: {TRAIN_CONFIG}[-{CKPT_NAME stem}].
+
+    TRAIN_CONFIG picks both the ckpt sub-directory and the hyper-param yml, so it
+    is what actually distinguishes two runs of the same task; CKPT_NAME is only
+    appended when it is not the default, to keep existing paths unchanged.
+    A policy whose weights are not selected by those variables (DreamTac: they
+    live in its inference server) names the run itself via `get_run_tag`.
+    """
+    import os
+    if hasattr(policy_module, 'get_run_tag'):
+        return policy_module.get_run_tag(deploy_config)
+    tag = os.environ.get('TRAIN_CONFIG') or 'train_config'
+    ckpt_name = os.environ.get('CKPT_NAME') or 'policy_last.ckpt'
+    if ckpt_name != 'policy_last.ckpt':
+        tag = f"{tag}-{Path(ckpt_name).stem}"
+    return tag
+
 task_module, policy_module = None, None
 def main():
     global args_cli, task_module, policy_module, log_path
@@ -216,9 +234,10 @@ def main():
     policy_module = importlib.import_module(f"policy.{policy_name}")
     
     curr_time = time.strftime(r'%Y-%m-%d_%H:%M:%S')
+    run_tag = get_run_tag(policy_module, deploy_config)
 
     env_cfg:BaseTaskCfg = task_module.TaskCfg()
-    env_cfg.save_dir = Path('eval_result') / policy_name / task_file_name / deploy_config_file.stem / curr_time
+    env_cfg.save_dir = Path('eval_result') / policy_name / task_file_name / deploy_config_file.stem / run_tag / curr_time
     env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
     env_cfg.obs_data_type = task_config.get("observations", {})
     env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)

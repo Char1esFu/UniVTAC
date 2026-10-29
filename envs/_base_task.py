@@ -73,6 +73,29 @@ from .sensors.camera import CameraManager, CameraCfg
 from .sensors.tactile import TactileManager, TactileCfg, create_tactile_cfg
 
 
+# Wrist-camera mount poses, expressed in the panda_hand frame, ROS convention
+# (+Z forward, -Y up). Regenerate any of these from a USD with
+# `python scripts/usd_related/inspect_wrist_camera.py`, which prints the pose in
+# both the USD-native opengl convention and the ros convention used here.
+#
+# BAKED reproduces the camera baked into the robot USD (`/panda/WristCamera/Camera`,
+# rigidly pinned to panda_hand by the `wrist_camera` FixedJoint). That is the camera
+# the released HuggingFace dataset was recorded with, so it must stay the mount used
+# whenever a policy is trained on that data -- any other mount makes `cam_wrist` an
+# out-of-distribution input at eval time.
+WRIST_CAM_MOUNT_BAKED = dict(
+    pos=(0.042818, -0.000568, 0.062735),
+    rot=(0.703091, 0.0, 0.0, 0.711100),  # wxyz
+)
+# TILTED pitches the optical axis 0.3 rad (17.2 deg) relative to BAKED, i.e.
+# quat_from_euler_xyz(0.0, -0.3, pi). Kept as a named alternative mount for
+# camera-placement ablations; needs data recorded with the same mount.
+WRIST_CAM_MOUNT_TILTED = dict(
+    pos=(0.042818, 0.0, 0.062735),
+    rot=(0.6994450614237633, -0.10562663504969942, -0.10571078187807803, 0.6988882962338909),
+)
+
+
 @configclass
 class BaseTaskCfg(DirectRLEnvCfg):
     logger_level = "error"
@@ -179,33 +202,26 @@ class BaseTaskCfg(DirectRLEnvCfg):
         CameraCfg(
             name="wrist",
             # Spawn a fresh camera as a child of the panda_hand link instead of
-            # reusing the one baked into the robot USD (which was rigidly pinned
-            # to panda_hand via a FixedJoint). The mount is now fully tunable
-            # here via `offset`. Defaults below reproduce the baked camera:
-            #   - pos/rot: pose of the USD `WristCamera/Camera` prim expressed in
-            #     the panda_hand frame. Read these straight from the USD with
-            #     `python inspect_wrist_camera.py` (the "cam-in-hand" block).
-            #   - intrinsics: identical to the baked camera (== the head camera).
-            #
-            # NOTE on convention: the value read from USD is in the OpenGL/USD
-            # camera convention (-Z forward, +Y up, +X right) -> opengl quat
-            # (w,x,y,z) = (0.0, 0.703091, 0.711100, 0.0). We pass it in the ROS
-            # convention instead; the equivalent ROS quat is just that opengl
-            # quat rotated 180 deg about local X (swaps to (w,x,y,z) =
-            # (0.703091, 0.0, 0.0, 0.711100) for this pose). pos is the same in
-            # both conventions. Both describe the exact same physical camera.
+            # reusing the one baked into the robot USD. Upstream pointed at the
+            # baked prim with `spawn=None`, but IsaacLab only applies
+            # `CameraCfg.offset` when it spawns the prim itself -- with
+            # `spawn=None` the pose comes from the USD alone and `offset` is a
+            # silent no-op. Spawning here is what makes the mount a config-level
+            # knob, so camera placement can be swept without editing a vendored
+            # third-party asset. See WRIST_CAM_MOUNT_* above for the available
+            # mounts; only the optical frame moves, the housing mesh and the
+            # arm's inertial properties stay put, which keeps the dynamics
+            # identical across placements.
             prim_path="/World/envs/env_.*/Robot/panda_hand/WristCamera",
-            offset=CameraCfg.OffsetCfg(
-                pos=(0.042818, 0.0, 0.062735),
-                # rot=tuple(quat_from_euler_xyz(
-                #     torch.tensor([0.0]), torch.tensor([-0.3]), torch.tensor([np.pi])
-                # )[0].tolist()),  # wxyz
-                rot=(0.6994450614237633, -0.10562663504969942, -0.10571078187807803, 0.6988882962338909), # wxyz
-                convention="ros",
-            ),
+            offset=CameraCfg.OffsetCfg(**WRIST_CAM_MOUNT_BAKED, convention="ros"),
             data_types=["rgb", "depth"],
+            # Intrinsics copied verbatim off the baked `WristCamera/Camera` prim,
+            # vertical_aperture included: IsaacLab would otherwise derive it from
+            # the aspect ratio (2.688 * 270/480 = 1.512) and write a different
+            # value onto the prim than the one the dataset was rendered with.
             spawn=sim_utils.PinholeCameraCfg(
-                focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688, clipping_range=(0.01, 100.0)
+                focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688,
+                vertical_aperture=15.2908, clipping_range=(0.01, 100.0)
             ),
             width=480,
             height=270,
