@@ -16,15 +16,7 @@ class TaskCfg(BaseTaskCfg):
             height=270,
             update_period=1/120
         ),
-        CameraCfg(
-            name="wrist",
-            prim_path="/World/envs/env_.*/Robot/WristCamera/Camera",
-            data_types=["rgb", "depth"],
-            spawn=None, # use existing camera
-            width=480,
-            height=270,
-            update_period=1/120,
-        )
+        WRIST_CAMERA_CFG,
     ]
     max_save_frames = 400
 

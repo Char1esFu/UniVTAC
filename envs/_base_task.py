@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import time
@@ -95,6 +96,34 @@ WRIST_CAM_MOUNT_TILTED = dict(
     rot=(0.6994450614237633, -0.10562663504969942, -0.10571078187807803, 0.6988882962338909),
 )
 
+# Wrist cameras; BaseTask picks one by BaseTaskCfg.use_cfg_cam.
+# CFG spawns a camera under panda_hand so the mount (WRIST_CAM_MOUNT_*) is
+# configurable; IsaacLab ignores `offset` when spawn=None.
+WRIST_CAMERA_CFG = CameraCfg(
+    name="wrist",
+    prim_path="/World/envs/env_.*/Robot/panda_hand/WristCamera",
+    offset=CameraCfg.OffsetCfg(**WRIST_CAM_MOUNT_BAKED, convention="ros"),
+    data_types=["rgb", "depth"],
+    # Copied from the baked camera prim, incl. vertical_aperture.
+    spawn=sim_utils.PinholeCameraCfg(
+        focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688,
+        vertical_aperture=15.2908, clipping_range=(0.01, 100.0)
+    ),
+    width=480,
+    height=270,
+    update_period=1/120,
+)
+# Camera baked into the robot USD; pose and intrinsics come from the USD.
+WRIST_CAMERA_BAKED_CFG = CameraCfg(
+    name="wrist",
+    prim_path="/World/envs/env_.*/Robot/WristCamera/Camera",
+    data_types=["rgb", "depth"],
+    spawn=None,
+    width=480,
+    height=270,
+    update_period=1/120,
+)
+
 
 @configclass
 class BaseTaskCfg(DirectRLEnvCfg):
@@ -186,6 +215,10 @@ class BaseTaskCfg(DirectRLEnvCfg):
     adaptive_grasp_depth_threshold = None # in mm
     reset_time_limit: float = 120.0  # in seconds
 
+    # Wrist camera: False = baked USD camera, True = WRIST_CAMERA_CFG.
+    # Env var UNIVTAC_USE_CFG_CAM=1/0 overrides it.
+    use_cfg_cam: bool = False
+
     cameras: list[CameraCfg] = [
         CameraCfg(
             name="head",
@@ -199,34 +232,7 @@ class BaseTaskCfg(DirectRLEnvCfg):
             height=270,
             update_period=1/120
         ),
-        CameraCfg(
-            name="wrist",
-            # Spawn a fresh camera as a child of the panda_hand link instead of
-            # reusing the one baked into the robot USD. Upstream pointed at the
-            # baked prim with `spawn=None`, but IsaacLab only applies
-            # `CameraCfg.offset` when it spawns the prim itself -- with
-            # `spawn=None` the pose comes from the USD alone and `offset` is a
-            # silent no-op. Spawning here is what makes the mount a config-level
-            # knob, so camera placement can be swept without editing a vendored
-            # third-party asset. See WRIST_CAM_MOUNT_* above for the available
-            # mounts; only the optical frame moves, the housing mesh and the
-            # arm's inertial properties stay put, which keeps the dynamics
-            # identical across placements.
-            prim_path="/World/envs/env_.*/Robot/panda_hand/WristCamera",
-            offset=CameraCfg.OffsetCfg(**WRIST_CAM_MOUNT_BAKED, convention="ros"),
-            data_types=["rgb", "depth"],
-            # Intrinsics copied verbatim off the baked `WristCamera/Camera` prim,
-            # vertical_aperture included: IsaacLab would otherwise derive it from
-            # the aspect ratio (2.688 * 270/480 = 1.512) and write a different
-            # value onto the prim than the one the dataset was rendered with.
-            spawn=sim_utils.PinholeCameraCfg(
-                focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688,
-                vertical_aperture=15.2908, clipping_range=(0.01, 100.0)
-            ),
-            width=480,
-            height=270,
-            update_period=1/120,
-        )
+        WRIST_CAMERA_CFG,
     ]
 
     robot: RobotCfg = None
@@ -295,6 +301,14 @@ class BaseTask(UipcRLEnv):
         self.set_debug_vis(self.cfg.debug_vis)
     
     def load_robot_and_sensors(self, cfg:BaseTaskCfg):
+        env_flag = os.environ.get('UNIVTAC_USE_CFG_CAM')
+        if env_flag is not None:
+            cfg.use_cfg_cam = env_flag.strip().lower() in ('1', 'true', 'yes')
+        wrist_cam = WRIST_CAMERA_CFG if cfg.use_cfg_cam else WRIST_CAMERA_BAKED_CFG
+        cfg.cameras = [wrist_cam if cam.name == 'wrist' else cam for cam in cfg.cameras]
+        print(f"[BaseTask] wrist camera: {'cfg (spawned)' if cfg.use_cfg_cam else 'baked (robot USD)'} "
+              f"-> {wrist_cam.prim_path}")
+
         data_type = ["camera_depth", "tactile_rgb", "marker_rgb", "marker_motion"]
         if cfg.tactile_sensor_type == 'gsmini':
             cfg.robot = create_franka_gsmini_gripper(data_type=data_type, debug_vis=cfg.debug_vis)
