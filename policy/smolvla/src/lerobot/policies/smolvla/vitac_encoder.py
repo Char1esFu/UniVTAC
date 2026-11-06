@@ -45,6 +45,16 @@ import torch.nn.functional as F  # noqa: N812
 
 log = logging.getLogger(__name__)
 
+# UniVTAC repo root (.../UniVTAC/policy/smolvla/src/lerobot/policies/smolvla/vitac_encoder.py).
+# Relative checkpoint paths are resolved against it so training (cwd
+# policy/smolvla) and the deploy server (cwd repo root) find the same file.
+UNIVTAC_ROOT = Path(__file__).resolve().parents[6]
+
+
+def resolve_univtac_path(path: str | Path) -> Path:
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else UNIVTAC_ROOT / path
+
 
 class BaseViTacEncoder(nn.Module, ABC):
     """Abstract base class for visuo-tactile encoders.
@@ -72,7 +82,7 @@ class BaseViTacEncoder(nn.Module, ABC):
         """Encode a single tactile stream.
 
         Args:
-            x: Image tensor of shape ``(B, 3, H, W)`` in ``[-1, 1]``.
+            x: Image tensor of shape ``(B, 3, H, W)`` in ``[0, 1]``.
 
         Returns:
             Token tensor of shape ``(B, num_tokens_per_stream, feature_dim)``.
@@ -275,9 +285,15 @@ class UniVTACEncoder(BaseViTacEncoder):
       UniVTAC pre-training script. The checkpoint may store either the full
       ``Tactile`` model state dict (``backbone.*`` + ``decoders.*``) or only
       the backbone; we strip the ``backbone.`` prefix and load the matching
-      keys with ``strict=False``.
-    * ``freeze_backbone=True`` -- freezes all torchvision parameters so only
-      the learned token queries and projection layer are trained.
+      keys with ``strict=False``. Relative paths resolve against the UniVTAC
+      repo root.
+    * ``freeze_backbone=True`` -- the backbone runs under ``no_grad`` so only
+      the learned token queries and projection layer are trained (this also
+      holds when PEFT re-enables ``requires_grad`` via ``modules_to_save``).
+
+    BatchNorm running statistics are always frozen (BN layers stay in eval
+    mode), matching the FrozenBatchNorm2d used by the ACT tactile backbone:
+    small policy batches must not overwrite the pretraining statistics.
     """
 
     _SUPPORTED_BACKBONES = ("resnet18", "resnet34", "resnet50")
@@ -322,9 +338,17 @@ class UniVTACEncoder(BaseViTacEncoder):
         if pretrained_path is not None:
             self.load_univtac_weights(pretrained_path)
 
+        self.freeze_backbone = freeze_backbone
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for m in self.backbone.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
+        return self
 
     def load_univtac_weights(self, ckpt_path: str | Path) -> None:
         """Load a UniVTAC pretrained checkpoint into the ResNet backbone.
@@ -334,7 +358,7 @@ class UniVTACEncoder(BaseViTacEncoder):
             or ``decoders.``) -- we keep only the backbone keys; or
           * store the bare ResNet state dict (no prefix).
         """
-        ckpt_path = Path(ckpt_path)
+        ckpt_path = resolve_univtac_path(ckpt_path)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"UniVTAC checkpoint not found: {ckpt_path}")
 
@@ -373,10 +397,14 @@ class UniVTACEncoder(BaseViTacEncoder):
         if x.shape[-2:] != tuple(self.input_size):
             x = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
 
-        # ResNet expects ImageNet-style 3-channel input; ViTac inputs live in
-        # [-1, 1] (consistent with SigLIP normalization upstream). The backbone
-        # accepts that range and the receptive field is the same.
-        latent = self.backbone(x)  # (B, latent_dims)
+        # Tactile images arrive in [0, 1] (prepare_tactile does not apply the
+        # SigLIP [-1, 1] rescale), which is the range the UniVTAC encoder was
+        # pretrained on.
+        if self.freeze_backbone:
+            with torch.no_grad():
+                latent = self.backbone(x)  # (B, latent_dims)
+        else:
+            latent = self.backbone(x)  # (B, latent_dims)
         feat = self.proj(latent)   # (B, feature_dim)
 
         # Broadcast pooled feature against learned token queries so each token

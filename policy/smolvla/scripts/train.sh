@@ -15,10 +15,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 TASK_NAME="${TASK_NAME:-lift_bottle}"
-TASK_CONFIG="${TASK_CONFIG:-demo}"
-EXPERT_DATA_NUM="${EXPERT_DATA_NUM:-2}"
+TASK_CONFIG="${TASK_CONFIG:-clean}"
+EXPERT_DATA_NUM="${EXPERT_DATA_NUM:-100}"
+TORCHRUN="${TORCHRUN:-${REPO_ROOT}/.venv/bin/torchrun}"
 
-export TASK_SETTINGS="${TASK_NAME}_${TASK_CONFIG}_${EXPERT_DATA_NUM}"
+# Must match the repo_id written by scripts/process_data.py.
+export TASK_SETTINGS="${TASK_NAME}-${TASK_CONFIG}-${EXPERT_DATA_NUM}"
 export REPO_ID="${REPO_ID:-local/${TASK_SETTINGS}_vitac}"
 export DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/data/${REPO_ID}}"
 
@@ -35,7 +37,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
-torchrun \
+"${TORCHRUN}" \
     --nproc_per_node="${NUM_GPUS}" \
     --nnodes="${NUM_NODES}" \
     --node_rank="${NODE_RANK}" \

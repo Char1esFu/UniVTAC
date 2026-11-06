@@ -565,9 +565,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        # wrap_with_peft freezes every base parameter, so the randomly
+        # initialized tactile modules must be fully trained (and saved with
+        # the adapter); otherwise they stay at their random init forever.
+        tactile_modules = [
+            name for name in ("vitac_encoder", "tactile_align_head", "film_head")
+            if getattr(self.model, name, None) is not None
+        ]
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": tactile_modules,
         }
 
     def _validate_peft_config(self, peft_config) -> None:

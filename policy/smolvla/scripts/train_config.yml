@@ -5,10 +5,19 @@ policy:
   tactile_fusion: cross_attn # film, token
   load_vlm_weights: true
   optimizer_lr: 1e-4
-  vitac_pretrained_path: "???"
+  # Tactile encoder: UniVTAC ResNet18 pretrained on simulated contact data.
+  # Relative paths resolve against the UniVTAC repo root (see vitac_encoder.py).
+  vitac_encoder_name: univtac
+  vitac_pretrained_path: encoder/checkpoints/resnet18/20251128-125750/best.pth
+  # Marker-overlay tactile images (what the encoder was pretrained on).
+  tactile_keys:
+    - observation.images.tactile_ll_marker
+    - observation.images.tactile_lr_marker
 
-peft:
-  method_type: lora
+# No PEFT: SmolVLA's native recipe (train_expert_only=True) keeps the VLM
+# frozen and fully trains the action expert, state/action projections and the
+# tactile modules -- the same recipe as policy/smolvla_vision. Only the VLM has
+# pretrained weights (load_vlm_weights); the expert starts from scratch.
 
 batch_size: 8
 steps: 30000

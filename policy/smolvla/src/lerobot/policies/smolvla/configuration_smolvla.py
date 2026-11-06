@@ -135,9 +135,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # character is the arm ("l"/"r"), and the third is the gripper of that
     # arm ("l"/"r"). Currently only a single arm is recorded so we default to
     # left arm + (left, right) grippers.
+    # The marker-overlay streams are the default because the UniVTAC tactile
+    # encoder was pretrained on marked RGB. These are the ONLY tactile streams
+    # the policy sees: every other ``observation.images.tactile_*`` stream in
+    # the dataset is dropped in ``validate_features`` (it never reaches SigLIP).
     tactile_keys: tuple[str, ...] = (
-        "observation.images.tactile_ll",
-        "observation.images.tactile_lr",
+        "observation.images.tactile_ll_marker",
+        "observation.images.tactile_lr_marker",
     )
 
     # ViTacEncoder selection.
@@ -178,6 +182,21 @@ class SmolVLAConfig(PreTrainedConfig):
             )
 
     def validate_features(self) -> None:
+        # Keep only the selected tactile streams; the dataset also carries the
+        # other variant (rgb vs marker) which would otherwise be fed to SigLIP
+        # as an extra camera. With use_tactile=False all tactile streams are
+        # left untouched and behave as ordinary cameras.
+        if self.use_tactile and self.input_features:
+            selected = set(self.tactile_keys)
+            for key in list(self.input_features):
+                if key.startswith(f"{OBS_IMAGES}.tactile_") and key not in selected:
+                    del self.input_features[key]
+            missing = selected - set(self.input_features)
+            if missing:
+                raise ValueError(
+                    f"tactile_keys {sorted(missing)} not found in input features "
+                    f"{sorted(self.input_features)}. Re-run process_data.py or fix --policy.tactile_keys."
+                )
         for i in range(self.empty_cameras):
             key = f"{OBS_IMAGES}.empty_camera_{i}"
             empty_camera = PolicyFeature(
