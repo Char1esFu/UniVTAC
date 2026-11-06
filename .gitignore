@@ -11,7 +11,7 @@
 .python.env
 /data/*
 !/data/download.sh
-!/data/download_hf_cluster.sh
+!/data/download_hf.sh
 /eval_result
 /policy/**/data*/**
 /policy/**/outputs*/**

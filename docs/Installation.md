@@ -172,4 +172,4 @@ bash collect_data.sh grasp_classify demo 0
 pip install modelscope
 bash data/download.sh --task --version 45 --checkpoint
 ```
-> Fork-specific alternative (HuggingFace + cluster symlink layout): `bash data/download_hf_cluster.sh`
+> Fork-specific alternative (HuggingFace, Isaac Sim 4.5 only): `bash data/download_hf.sh local` (into this repo) or `bash data/download_hf.sh cluster` (stored under `$WORK`, symlinked into the repo)
