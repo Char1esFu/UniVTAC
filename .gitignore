@@ -11,6 +11,7 @@
 .python.env
 /data/*
 !/data/download.sh
+!/data/download_hf_cluster.sh
 /eval_result
 /policy/**/data*/**
 /policy/**/outputs*/**
@@ -59,3 +60,29 @@ textures.zip
 
 # agent
 .claude/
+
+# from upstream
+.vscode
+**/__pycache__/
+assets/objects/ipt
+assets/objects/opt
+assets/objects/BlueBlock*
+assets/objects/GreenBlock*
+assets/objects/OrangeBlock*
+assets/objects/textures
+assets/objects/.thumbs
+assets/textures/*
+!assets/textures/Cherry*
+replay
+traj*
+policy/ACT_UniT
+/*.ipynb
+/.codex
+/third_party/*
+!/third_party/TacEx
+/assets/embodiments/ARX-X5
+/policy/**/*.png
+/policy/**/*.pkl
+/policy/**/*.ckpt
+/.env
+envs/insert_tube.py

@@ -116,7 +116,7 @@ def create_gf225_cfg(
             resolution=resolution,
             update_period=update_period,
             data_types=["depth"],
-            clipping_range=(0.02, 0.0265),
+            clipping_range=(0.02, 0.029),
         ),
         device="cuda",
         debug_vis=debug_vis,
@@ -127,7 +127,7 @@ def create_gf225_cfg(
             marker_radius=8,
             marker_shape=(9, 9),
             marker_interval=(2.0, 2.0),
-            camera_to_surface=0.0265,
+            camera_to_surface=0.029,
             real_size = (0.0235, 0.0250),
             sensor_type='gf225',
         ),
@@ -181,19 +181,24 @@ def create_xensews_cfg(
             update_period=update_period,
             resolution=resolution,
             data_types=["depth", "rgb"],
-            clipping_range=(0.01, 0.03),  # (0.024, 0.034),
+            clipping_range=(0.01, 0.03),
         ),
         device="cuda",
         debug_vis=debug_vis,  # for rendering sensor output in the gui
         update_period=update_period,
         marker_motion_sim_cfg=ManiSkillSimulatorCfg(
             tactile_img_res=resolution,
+            marker_shape=(20, 11),
+            marker_interval=(1.15, 1.2),
             sub_marker_num=0,
+            marker_radius=2,
+            camera_to_surface=0.0245,
+            real_size=(0.0293, 0.0175),
             sensor_type='xensews',
         ),
         data_types=data_type
     )
-    sensor_cfg.marker_motion_sim_cfg.marker_params.num_markers = 1200
+    sensor_cfg.marker_motion_sim_cfg.marker_params.num_markers = 220
     sensor_cfg.optical_sim_cfg = sensor_cfg.optical_sim_cfg.replace(
         with_shadow=False,
         tactile_img_res=resolution,
@@ -283,8 +288,6 @@ class VisualTactileSensor:
         init_trans = estimate_rigid_transform(self.origin_pts, attach_pts)
         self.attach_to_init = np.linalg.inv(init_trans)
         self.attach_to_init = torch.tensor(self.attach_to_init, dtype=torch.float64, device=self.device)
-
-        self.sensor.marker_motion_simulator.marker_motion_sim.init_vertices()
 
     def get_attach_pose(self):
         if type(self.attachment.isaaclab_rigid_object) is Articulation:

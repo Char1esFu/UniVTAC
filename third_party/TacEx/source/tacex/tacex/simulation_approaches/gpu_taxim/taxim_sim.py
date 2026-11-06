@@ -53,7 +53,7 @@ class TaximSimulator(GelSightSimulator):
             device=self._device,
         )
 
-        self._taxim: Taxim = Taxim(calib_folder=calib_folder, device=self._device)
+        self._taxim: Taxim = Taxim(calib_folder=calib_folder, device=self._device, backend='torch')
         # update Taxim settings via settings from cfg class
         # print(self._taxim.width)
         # self._taxim.width = self.cfg.tactile_img_res[0]

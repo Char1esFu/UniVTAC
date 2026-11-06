@@ -3,7 +3,7 @@ import numpy as np
 
 @configclass
 class TaskCfg(BaseTaskCfg):
-    adaptive_grasp_depth_threshold = 27.75
+    adaptive_grasp_depth_threshold = {'gsmini': 27.8, 'gf225': 25.6, 'xensews': 25.1}
 
 class Task(BaseTask):
     def __init__(self, cfg: BaseTaskCfg, mode:Literal['collect', 'eval'] = 'collect', render_mode: str|None = None, **kwargs):

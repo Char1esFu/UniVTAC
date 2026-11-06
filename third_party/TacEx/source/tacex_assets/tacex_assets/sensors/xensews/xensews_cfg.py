@@ -28,7 +28,7 @@ class XenseWSCfg(GelSightSensorCfg):
         update_period=0,
         resolution=(320, 160),
         data_types=["depth", "rgb"],
-        clipping_range=(0.0230, 0.0290),
+        clipping_range=(0.01, 0.028),
     )
 
     update_period: float = 0.01
@@ -47,7 +47,7 @@ class XenseWSCfg(GelSightSensorCfg):
     """
 
     optical_sim_cfg = TaximSimulatorCfg(
-        calib_folder_path=f"{TACEX_ASSETS_DATA_DIR}/Sensors/GelSight_Mini/calibs/640x480",
+        calib_folder_path=f"{TACEX_ASSETS_DATA_DIR}/Sensors/XenseWS/calibs/640x480",
         gelpad_height=gelpad_dimensions.height,
         gelpad_to_camera_min_distance=0.0230,
         with_shadow=False,

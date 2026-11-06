@@ -21,7 +21,7 @@ import torch
 
 import usdrt
 import usdrt.UsdGeom
-from sklearn.neighbors import NearestNeighbors
+from scipy.spatial import Delaunay
 
 import isaaclab.utils.math as math_utils
 
@@ -252,47 +252,22 @@ class VisionTactileSensorUIPC:
     
     def _gen_marker_weight(self, marker_pts):
         surface_pts = self.init_surface_vertices_camera.cpu().numpy()[:, :2]
-        # marker_on_surface = in_hull(marker_pts, surface_pts)
-        # marker_pts = marker_pts[marker_on_surface]
+        surface_pts = surface_pts - (surface_pts.min(axis=0) + surface_pts.max(axis=0)) / 2
 
-        face_idx_to_surface_idx = np.zeros(np.max(self.faces_on_surfaces)+1, dtype=np.int32)
-        face_idx_to_surface_idx[self.vertices_on_surface] = np.arange(surface_pts.shape[0])
-        faces_v_on_surface = surface_pts[face_idx_to_surface_idx[self.faces_on_surfaces.flatten()]].reshape(-1, 3, 2)
-        f_centers = np.mean(faces_v_on_surface, axis=1)
+        tri = Delaunay(surface_pts)
+        simplex_idx = tri.find_simplex(marker_pts, tol=1e-5)
+        valid_marker_idx = np.flatnonzero(simplex_idx >= 0).astype(np.int32)
+        if valid_marker_idx.size != marker_pts.shape[0]:
+            raise RuntimeError("Some marker points are outside the convex hull of the surface vertices!")
 
-        nbrs = NearestNeighbors(n_neighbors=4, algorithm="ball_tree").fit(f_centers)
-        distances, face_idx = nbrs.kneighbors(marker_pts)
-
-        marker_pts_surface_idx = []
-        marker_pts_surface_weight = []
-        valid_marker_idx = []
-
-        # compute barycentric weight of each vertex
-        for i in range(marker_pts.shape[0]):
-            possible_face_ids = face_idx[i]
-            p = marker_pts[i]
-            for possible_face_id in possible_face_ids.tolist():
-                face_vertices_idx = face_idx_to_surface_idx[self.faces_on_surfaces[possible_face_id]]
-                vertices_of_face_i = surface_pts[face_vertices_idx]
-                p0, p1, p2 = vertices_of_face_i
-                A = np.stack([p1 - p0, p2 - p0], axis=1)
-                w12 = np.linalg.inv(A) @ (p - p0)
-                if possible_face_id == possible_face_ids[0]:
-                    marker_pts_surface_idx.append(face_vertices_idx)
-                    marker_pts_surface_weight.append(np.array([1 - w12.sum(), w12[0], w12[1]]))
-                    valid_marker_idx.append(i)
-                    if w12[0] >= 0 and w12[1] >= 0 and w12[0] + w12[1] <= 1:
-                        break
-                elif w12[0] >= 0 and w12[1] >= 0 and w12[0] + w12[1] <= 1:
-                    marker_pts_surface_idx[-1] = face_vertices_idx
-                    marker_pts_surface_weight[-1] = np.array([1 - w12.sum(), w12[0], w12[1]])
-                    valid_marker_idx[-1] = i
-                    break
-
-        valid_marker_idx = np.array(valid_marker_idx).astype(np.int32)
         marker_pts = marker_pts[valid_marker_idx]
-        marker_pts_surface_idx = np.stack(marker_pts_surface_idx)
-        marker_pts_surface_weight = np.stack(marker_pts_surface_weight)
+        valid_simplex_idx = simplex_idx[valid_marker_idx]
+        marker_pts_surface_idx = tri.simplices[valid_simplex_idx]
+
+        transform = tri.transform[valid_simplex_idx]
+        w12 = np.einsum("nij,nj->ni", transform[:, :2, :], marker_pts - transform[:, 2, :])
+        marker_pts_surface_weight = np.column_stack((w12, 1 - w12.sum(axis=1)))
+
         assert np.allclose(
             (surface_pts[marker_pts_surface_idx] * marker_pts_surface_weight[..., None]).sum(1)[:, :2],
             marker_pts,

@@ -307,6 +307,9 @@ class BaseTask(UipcRLEnv):
         
         if cfg.adaptive_grasp_depth_threshold is None:
             cfg.adaptive_grasp_depth_threshold = cfg.robot.adaptive_grasp_depth_threshold
+        elif isinstance(cfg.adaptive_grasp_depth_threshold, dict):
+            cfg.adaptive_grasp_depth_threshold = cfg.adaptive_grasp_depth_threshold.get(
+                cfg.tactile_sensor_type, cfg.robot.adaptive_grasp_depth_threshold)
         return cfg
  
     def _setup_save(self):

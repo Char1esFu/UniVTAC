@@ -1,0 +1,13 @@
+{
+    "sim-lift_bottle-clean-2": {
+        "dataset_dir": "data/sim-lift_bottle/clean-2",
+        "num_episodes": 2,
+        "episode_len": 325,
+        "camera_names": [
+            "cam_head",
+            "cam_wrist",
+            "tac_left",
+            "tac_right"
+        ]
+    }
+}

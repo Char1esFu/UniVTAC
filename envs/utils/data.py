@@ -8,18 +8,19 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+from typing import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class HDF5Handler:
     @staticmethod
-    def stream_to_img(data, resize=False, convert_channels=False, path=None) -> np.ndarray:
+    def stream_to_img(data, process_transform: Callable[[np.ndarray], np.ndarray] = None) -> np.ndarray:
         """
         将一个字节流数组解码为图像数组。
 
         Args:
             data: np.ndarray of shape (N,), 每个元素要么是 Python bytes，要么是 np.ndarray(dtype=uint8)
         Returns:
-            imgs: np.ndarray of shape (N, H, W, C), dtype=uint8
+            imgs: np.ndarray of shape (N, H, W, C)
         """
         # 确保 data 是可迭代的一维数组
         flat = data.ravel()
@@ -38,20 +39,13 @@ class HDF5Handler:
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if img is None:
                 raise ValueError(f"Failed to decode image from buffer!")
-            if resize and path is not None:
-                if 'observation' in path:
-                    # img = cv2.resize(img, (480, 270))  # Resize to 480x270 for observation images
-                    # img = cv2.resize(img, (240, 240))  # Resize to 320x240 for observation images
-                    img = cv2.resize(img, (256, 256))
-                elif 'tactile' in path:
-                    # img = cv2.resize(img, (320, 240))  # Resize to 320x240 for tactile images
-                    img = cv2.resize(img, (256, 256))
-            if convert_channels:
-                img = np.transpose(img, (2, 0, 1)) # HWC -> CHW
+            
             if imgs is None:
                 imgs = np.empty((img_len, *img.shape), dtype=np.uint8)
             imgs[idx] = img
-
+ 
+        if process_transform is not None:
+            imgs = process_transform(imgs)
         return imgs
 
     @staticmethod
@@ -95,30 +89,30 @@ class HDF5Handler:
                         v = v[0]
                 target[k].append(v)
 
-    def hdf5_to_dict(self, node:h5py.Group, resize=False, convert_channels=False):
+    def hdf5_to_dict(self, node:h5py.Group):
         result = {}
         for name, item in node.items():
             if isinstance(item, h5py.Dataset):
                 data = item[()]
                 if "rgb" in name:
-                    result[name] = self.stream_to_img(data, resize, convert_channels)
+                    result[name] = self.stream_to_img(data)
                 else:
                     result[name] = data
             elif isinstance(item, h5py.Group):
-                result[name] = self.hdf5_to_dict(item, resize, convert_channels)
+                result[name] = self.hdf5_to_dict(item)
 
         if hasattr(node, "attrs") and len(node.attrs) > 0:
             result["_attrs"] = dict(node.attrs)
         return result
 
-    def gather_hdf5(self, node:h5py.Group, data_paths:list[str], resize=False, convert_channels=False):
+    def gather_hdf5(self, node:h5py.Group, data_paths:list[tuple[str, Callable[[np.ndarray], np.ndarray]|None]]):
         result = {}
-        for data_path in data_paths:
+        for data_path, process_transform in data_paths:
             endpoint = data_path.rsplit('/', 1)[-1]
             if 'rgb' in endpoint:
-                result[data_path] = self.stream_to_img(node[data_path][()], resize, convert_channels, path=data_path)
+                result[data_path] = self.stream_to_img(node[data_path][()], process_transform)
             else:
-                result[data_path] = node[data_path][()]
+                result[data_path] = node[data_path][()] if process_transform else node[data_path][()]
         return result
     
     def load_hdf5_metadata(self, hdf5_path, column:str='step'):
@@ -130,8 +124,7 @@ class HDF5Handler:
         }
 
     def batch_gather_hdf5(
-        self, hdf5_paths, data_paths:list[str], workers=4,
-        resize=False, convert_channels=False, downsample_factor=2
+        self, hdf5_paths, data_paths:list[tuple[str, Callable[[np.ndarray], np.ndarray]|None]], workers=4, downsample_factor=1
     ):
         episode_start, episode_ends = 0, []
         for pid, path in enumerate(hdf5_paths):
@@ -145,12 +138,13 @@ class HDF5Handler:
         result = {}
         # process the first file to initialize the arrays
         with h5py.File(hdf5_paths[0], "r") as f:
-            for data_path in data_paths:
+            for data_path, process_transform in data_paths:
                 endpoint = data_path.rsplit('/', 1)[-1]
                 if 'rgb' in endpoint:
-                    data = self.stream_to_img(f[data_path][()], resize, convert_channels, path=data_path)
+                    data = self.stream_to_img(f[data_path][()], process_transform)
                 else:
-                    data = f[data_path][()]
+                    data = process_transform(f[data_path][()]) if process_transform else f[data_path][()]
+                
                 if data_path not in result:
                     if data_path == 'embodiment/joint':
                         result['embodiment/joint_action'] = np.empty(
@@ -179,13 +173,13 @@ class HDF5Handler:
         def process(eid):
             nonlocal result
             with h5py.File(hdf5_paths[eid], "r") as f:
-                for data_path in data_paths:
+                for data_path, process_transform in data_paths:
                     endpoint = data_path.rsplit('/', 1)[-1]
                     if 'rgb' in endpoint:
-                        data = self.stream_to_img(f[data_path][()], resize, convert_channels, path=data_path)
+                        data = self.stream_to_img(f[data_path][()], process_transform)
                     else:
-                        data = f[data_path][()]
-                
+                        data = process_transform(f[data_path][()]) if process_transform else f[data_path][()]
+
                     downsample_arange = np.arange(0, len(data)-1, downsample_factor)
                     if data_path == 'embodiment/joint':
                         result['embodiment/joint_action'][episode_ends[eid-1]:episode_ends[eid]] = data[1:][downsample_arange]
@@ -203,13 +197,13 @@ class HDF5Handler:
         result['episode_ends'] = np.array(episode_ends, dtype=np.int64)
         return result
 
-    def load_hdf5(self, hdf5_path, data_paths:list[str]|None=None, resize=False, convert_channels=False, downsample_factor=2):
+    def load_hdf5(self, hdf5_path, data_paths:list[str]|None=None):
         assert Path(hdf5_path).exists(), f"{hdf5_path} does not exist"
         with h5py.File(hdf5_path, "r") as f:
             if data_paths is None:
-                data_dict = self.hdf5_to_dict(f, resize=resize, convert_channels=convert_channels)
+                data_dict = self.hdf5_to_dict(f)
             else:
-                data_dict = self.gather_hdf5(f, data_paths, resize=resize, convert_channels=convert_channels, downsample_factor=downsample_factor)
+                data_dict = self.gather_hdf5(f, data_paths)
         return data_dict
     
     def dict_to_hdf5(self, node:h5py.Group, data:dict, encode_images=True):

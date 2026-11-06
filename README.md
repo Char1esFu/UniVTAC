@@ -5,7 +5,29 @@
 
 **UniVTAC** is a tactile-aware simulation benchmark for robotic manipulation built on top of **NVIDIA Isaac Lab** and **TacEx (UIPC-based tactile simulation)**. It provides a unified framework for collecting expert demonstrations, training visuotactile policies, and evaluating them across a diverse suite of contact-rich manipulation tasks — all with high-fidelity tactile feedback from simulated GelSight Mini, ViTai GF225, or XenseWS sensors.
 
+## News
+
+- **2026-09** — UniVTAC was accepted to **CoRL 2026**.
+- **2026-09** — Uploaded and updated the Isaac Sim 5.1 task dataset.
+
+> [!IMPORTANT]
+> The `main` branch targets Isaac Sim 4.5, while the `isaac51` branch
+> supports Isaac Sim 5.1. The Isaac Sim 5.1 release delivers up to **5x
+> higher data-collection throughput** than the Isaac Sim 4.5 version and
+> supports NVIDIA RTX 40- and 50-series GPUs. Data collected with the two
+> versions is not cross-compatible. Both Isaac Sim 4.5 and 5.1 task datasets
+> are available in the dataset repository; select the version that matches the
+> code branch and simulator environment you use.
+
 ## Installation
+
+The `main` branch targets Isaac Sim 4.5.0 and Isaac Lab 2.1.1. Run `scripts/install.sh` to set up the `UniVTAC` Conda environment with Python 3.10 and install Isaac Sim, Isaac Lab, TacEx, and cuRobo.
+
+```bash
+git clone https://github.com/univtac/UniVTAC.git
+cd UniVTAC
+bash scripts/install.sh
+```
 
 See the [Installation Guide](./docs/Installation.md) for detailed setup instructions, including installing the environment, installing TacEx from the modified local source and setting up cuRobo for motion planning.
 
@@ -38,11 +60,53 @@ UniVTAC currently includes the following manipulation tasks, all featuring tacti
 | **Put Bottle in Shelf** | `put_bottle_in_shelf` | Place a bottle onto a shelf |
 | **Grasp & Classify** | `grasp_classify` | Grasp an object and classify it by tactile feedback |
 
+To build more tasks, refer to the [Task Creation Guide](./docs/TaskCreation.md) for instructions on how to define new manipulation tasks within the UniVTAC framework.
+
 ## Data Collection
 
 See the [Data Collection Guide](./docs/Collection.md) for instructions on how to run the automated data collection pipeline, configure task-specific parameters, and understand the output data structure.
 
-Dataset containing 100 episodes per task can be downloaded from [HuggingFace](https://huggingface.co/datasets/byml/UniVTAC), [Modelscope](https://modelscope.cn/datasets/byml2024/UniVTAC) or by running the script in `data/download.sh`.
+The dataset is available from [HuggingFace](https://huggingface.co/datasets/byml/UniVTAC)
+and [ModelScope](https://modelscope.cn/datasets/byml2024/UniVTAC). Its published
+layout is:
+
+| Path | Contents |
+|---|---|
+| `isaac45/<task>/` | Isaac Sim 4.5 demonstrations: 100 HDF5 episodes and one `metadata.json` for each of the 8 tasks |
+| `isaac51/<task>/` | Isaac Sim 5.1 demonstrations: 100 HDF5 episodes and one `metadata.json` for each of the 8 tasks |
+| `contact/<shape>/` | Contact-pretraining trajectories for 14 non-empty shapes (638 HDF5 episodes in the current release) |
+| `checkpoints/` | Policy checkpoints, metadata, dataset statistics, logs, and the shared tactile encoder; the current checkpoint release is trained for the Isaac Sim 4.5 dataset only |
+
+Task trajectories are stored under `hdf5/*.hdf5`. Because simulator versions
+are not interchangeable, downloading task data requires an explicit version.
+Use `--version 45` with this `main` branch; use `--version 51` with the
+`isaac51` branch:
+
+```bash
+# All Isaac Sim 4.5 task demonstrations for main
+bash data/download.sh --task --version 45
+
+# One Isaac Sim 4.5 task
+bash data/download.sh --task lift_can --version 45
+
+# Other independently selectable dataset components
+bash data/download.sh --contact
+bash data/download.sh --checkpoint
+
+# Select multiple components in one invocation
+bash data/download.sh --task --version 45 --contact --checkpoint
+```
+
+Selectors may be narrowed and repeated, for example
+`--contact Cross --contact Sphere` or
+`--checkpoint lift_can --checkpoint insert_hole`. Files are placed under
+`data/` by default while preserving the paths shown above. Run
+`bash data/download.sh --help` for output-directory, revision,
+parallelism, and force-download options.
+
+> [!NOTE]
+> The currently released policy checkpoints are associated with the Isaac Sim
+> 4.5 demonstrations. They should not be treated as Isaac Sim 5.1 checkpoints.
 
 ## Train & Eval Policies
 

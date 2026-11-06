@@ -46,7 +46,7 @@ class ManiSkillSimulatorCfg(GelSightSimulatorCfg):
     
     sub_marker_num: int = 0
 
-    marker_radius: float = 0.01 # in mm
+    marker_radius: float = 1 # in mm
 
     @configclass
     class MarkerParams:

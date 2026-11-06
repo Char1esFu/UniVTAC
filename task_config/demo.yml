@@ -4,7 +4,7 @@ decimation: 1
 
 save_frequency: 2
 video_frequency: 2
-render_frequency: 0 # set to 1 to one IsaacSim App window
+render_frequency: 1 # set to 1 to one IsaacSim App window
 
 random_texture: false # set to true to enable random texture
 
