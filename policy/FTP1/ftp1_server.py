@@ -13,12 +13,21 @@ Run (from anywhere; the ftp1-policy checkout provides `openpi`):
 Protocol (localhost, one model resident at a time):
 
     POST /load   JSON {"task": str, "checkpoint_dir": str|null, "domain_name": str|null}
-                 -> JSON {"checkpoint_dir", "domain_name", "action_rep", "action_horizon", "use_tactile_input"}
+                 -> JSON {"checkpoint_dir", "domain_name", "action_rep", "action_horizon", "use_tactile_input",
+                          "prediction_streams"}
     POST /infer  npz {qpos8 (8,), head (224,224,3) u8, [wrist (224,224,3) u8],
-                      [tactile (2,224,224,3) u8], prompt (0-d str)}
+                      [tactile (2,224,224,3) u8], prompt (0-d str),
+                      [stream_ablation (0-d str), stream_compare (0-d bool)]}
                  -> npz {chunk8 (H, 8) f32}: FTP-1 chunk mapped to UniVTAC 7 arm + 1 gripper,
                     still in the checkpoint's action_joint_rep (the client resolves it to qpos).
+                    With stream_compare also ref_chunk8 (H, 8): the unablated chunk from the same
+                    noise seed (another seed for stream_ablation "normal": the sampling-noise floor).
     GET  /health -> JSON of the currently loaded model (or {"loaded": false})
+
+World-action-model (WAM) checkpoints, which denoise future tactile latents ("prediction
+streams") jointly with the actions, need model code that may only exist in another
+checkout; point --openpi_src at its src/ dir. See STREAM_ABLATIONS for the inference-time
+ablations used to test whether the actions actually read the stream tokens.
 
 Mapping and preprocessing mirror ftp1-policy/UniVTAC/scripts/eval_ftp1.py, which
 produced the published UniVTAC numbers.
@@ -37,6 +46,7 @@ import argparse
 import io
 import json
 import logging
+import sys
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 from pathlib import Path
@@ -44,6 +54,17 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# --openpi_src must take effect before openpi is imported: world-action-model (WAM)
+# checkpoints need model code (prediction streams) that the ftp1-policy checkout may
+# not have yet, e.g. a snapshot of the cluster's src/. The uv env installs openpi as a
+# plain .pth path entry, so a sys.path entry in front of it wins.
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--openpi_src", type=Path, default=None)
+_OPENPI_SRC = _pre_parser.parse_known_args()[0].openpi_src
+if _OPENPI_SRC is not None:
+    sys.path.insert(0, str(_OPENPI_SRC.expanduser().resolve()))
+
+import openpi  # noqa: E402
 from openpi.models_pytorch.ftp1_model_config import FTP1_RESERVED_ACTION_DIM
 from openpi.models_pytorch.ftp1_model_config import FTP1_SINGLE_ARM_ACTION_REP_DIM
 from openpi.policies.ftp1_inference_wrapper import FTP1InferenceWrapper
@@ -105,12 +126,53 @@ def _resolve_domain_name(checkpoint_dir: Path) -> str:
     return domains[0]
 
 
+# Inference-time interventions on the prediction-stream tokens of a WAM checkpoint
+# (tactile latents denoised jointly with the action chunk, attending to the action
+# tokens in the action expert). They separate the two ways joint denoising can help:
+# (1) the auxiliary latent loss shaped the shared weights, which survives the
+# intervention; (2) the action tokens read the model's own imagined future through
+# attention while sampling, which the intervention breaks.
+#   normal   unchanged joint denoising
+#   noise    at every denoising step the stream tokens fed to the model are their initial
+#            Gaussian noise, never updated, so the actions attend to noise instead of the
+#            imagined future
+STREAM_ABLATIONS = ("normal", "noise")
+
+
+class StreamAblation:
+    """Wraps FTP1Pytorch.denoise_step (an instance attribute shadowing the method) to rewrite stream tokens.
+
+    sample_actions starts the stream tokens from noise at t = 1 and Euler-updates them with the stream velocity
+    of each step; with mode "noise" that update is ignored and every step sees the initial noise again.
+    """
+
+    def __init__(self, model):
+        self.mode = "normal"
+        self._eps: dict[str, torch.Tensor] | None = None
+        self._orig = model.denoise_step
+        model.denoise_step = self._denoise_step
+
+    def _denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep, *args, stream_x_t=None,
+                      stream_context=None, **kwargs):
+        if stream_x_t is not None and self.mode != "normal":
+            if float(timestep.reshape(-1)[0]) > 1.0 - 1e-4:  # first step: stream_x_t is the initial noise
+                self._eps = stream_x_t
+            if self.mode == "noise":
+                stream_x_t = self._eps
+            else:
+                raise ValueError(f"Unknown stream ablation {self.mode!r}")
+        return self._orig(prefix_pad_masks, past_key_values, x_t, timestep, *args,
+                          stream_x_t=stream_x_t, stream_context=stream_context, **kwargs)
+
+
 class FTP1Runner:
-    def __init__(self, ckpt_root: Path, device: str, num_inference_steps: int):
+    def __init__(self, ckpt_root: Path, device: str, num_inference_steps: int, seed: int = 0):
         self.ckpt_root = ckpt_root
         self.device = device
         self.num_inference_steps = num_inference_steps
         self.wrapper: FTP1InferenceWrapper | None = None
+        self.ablation: StreamAblation | None = None
+        self.rng = np.random.default_rng(seed)
         self.info: dict = {"loaded": False}
 
     def load(self, task: str, checkpoint_dir: str | None, domain_name: str | None) -> dict:
@@ -125,6 +187,7 @@ class FTP1Runner:
             raise ValueError(f"Unsupported action_joint_rep in {ckpt}/train_config.json")
 
         self.wrapper = None  # release the previous model before allocating the next one
+        self.ablation = None
         logger.info("Loading FTP-1 checkpoint %s (domain=%s)", ckpt, domain)
         self.wrapper = FTP1InferenceWrapper(
             checkpoint_dir=str(ckpt),
@@ -142,6 +205,9 @@ class FTP1Runner:
                 torch.cuda.memory_reserved() / 1e9,
             )
         action_dim = int(self.wrapper.get_action_dim())
+        prediction_streams = list(getattr(self.wrapper.model_config, "prediction_streams", ()) or ())
+        if len(getattr(self.wrapper.model, "stream_heads", {})) > 0:
+            self.ablation = StreamAblation(self.wrapper.model)
         self.info = {
             "loaded": True,
             "task": task,
@@ -152,11 +218,45 @@ class FTP1Runner:
             "layout": _infer_layout(action_dim),
             "action_horizon": int(self.wrapper.get_action_horizon()),
             "use_tactile_input": bool(getattr(self.wrapper.model_config, "use_tactile_input", True)),
+            "prediction_streams": prediction_streams,
+            "openpi": str(Path(openpi.__file__).parent),
         }
         logger.info("Loaded: %s", self.info)
         return self.info
 
-    def infer(self, req: dict[str, np.ndarray]) -> np.ndarray:
+    def infer(self, req: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """-> {chunk8, [ref_chunk8]}; see the protocol in the module docstring."""
+        mode = str(req["stream_ablation"]) if "stream_ablation" in req else "normal"
+        compare = bool(req["stream_compare"]) if "stream_compare" in req else False
+        if mode not in STREAM_ABLATIONS:
+            raise ValueError(f"stream_ablation must be one of {STREAM_ABLATIONS}, got {mode!r}")
+        if self.ablation is None:
+            if mode != "normal" or compare:
+                raise ValueError(
+                    f"stream_ablation={mode!r} / stream_compare={compare} need a checkpoint with prediction streams; "
+                    f"{self.info.get('checkpoint_dir')} has none (did the server start with --openpi_src?)"
+                )
+            return {"chunk8": self._infer_chunk8(req)}
+
+        out = {}
+        seed = int(self.rng.integers(2**31))
+        if compare:
+            # Reference: unablated joint denoising. With the same seed, the ablated pass starts from the same
+            # action (and stream) noise, so their difference is the ablation alone, not sampling noise.
+            torch.manual_seed(seed)
+            self.ablation.mode = "normal"
+            out["ref_chunk8"] = self._infer_chunk8(req)
+            # For mode "normal" the same seed would reproduce the reference exactly; another seed instead makes
+            # ref_chunk8 vs chunk8 the sampling-noise floor that the ablations are compared against.
+            torch.manual_seed(seed if mode != "normal" else seed + 1)
+        self.ablation.mode = mode
+        try:
+            out["chunk8"] = self._infer_chunk8(req)
+        finally:
+            self.ablation.mode = "normal"
+        return out
+
+    def _infer_chunk8(self, req: dict[str, np.ndarray]) -> np.ndarray:
         if self.wrapper is None:
             raise RuntimeError("No model loaded; POST /load first")
         action_dim = self.info["action_dim"]
@@ -219,7 +319,7 @@ def _make_handler(runner: FTP1Runner):
                     with np.load(io.BytesIO(self._body()), allow_pickle=False) as npz:
                         req = {k: npz[k] for k in npz.files}
                     buf = io.BytesIO()
-                    np.savez(buf, chunk8=runner.infer(req))
+                    np.savez(buf, **runner.infer(req))
                     self._send(200, buf.getvalue(), "application/octet-stream")
                 else:
                     self._send_json(404, {"error": f"unknown path {self.path}"})
@@ -246,11 +346,19 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_inference_steps", type=int, default=10)
     parser.add_argument("--preload_task", default=None, help="Load this task's checkpoint before serving")
+    parser.add_argument(
+        "--openpi_src",
+        type=Path,
+        default=None,
+        help="Import openpi from this src/ dir instead of the uv project's (e.g. a snapshot with WAM model code)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Seeds the stream_compare reference passes")
     args = parser.parse_args()
 
     # openpi installs a WARNING-level root handler on import; replace it so INFO lines show.
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s %(name)s] %(message)s", force=True)
-    runner = FTP1Runner(args.ckpt_root, args.device, args.num_inference_steps)
+    logger.info("openpi from %s", Path(openpi.__file__).parent)
+    runner = FTP1Runner(args.ckpt_root, args.device, args.num_inference_steps, args.seed)
     if args.preload_task:
         runner.load(args.preload_task, None, None)
     server = HTTPServer((args.host, args.port), _make_handler(runner))

@@ -16,8 +16,10 @@ its eval_ftp1.sh (the published UniVTAC numbers):
 """
 
 import io
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -107,11 +109,27 @@ def _checkpoint_tag(checkpoint_dir) -> str:
     return f"{path.parent.name}-{path.name}" if path.name.isdigit() else path.name
 
 
+STREAM_ABLATIONS = ("normal", "noise")  # see ftp1_server.py
+
+
+def _stream_settings(deploy_config) -> tuple[str, bool]:
+    """(stream_ablation, stream_compare), with FTP1_STREAM_ABLATION / FTP1_STREAM_COMPARE overriding the yml."""
+    mode = os.environ.get("FTP1_STREAM_ABLATION") or deploy_config.get("stream_ablation") or "normal"
+    if mode not in STREAM_ABLATIONS:
+        raise ValueError(f"stream_ablation must be one of {STREAM_ABLATIONS}, got {mode!r}")
+    compare_env = os.environ.get("FTP1_STREAM_COMPARE")
+    compare = compare_env.lower() in ("1", "true", "yes") if compare_env else bool(deploy_config.get("stream_compare"))
+    return mode, compare
+
+
 def get_run_tag(deploy_config) -> str:
     """Name eval_result/ runs after the weights; eval_policy.py's TRAIN_CONFIG default does not apply."""
     if deploy_config.get("checkpoint_dir"):
-        return _checkpoint_tag(deploy_config["checkpoint_dir"])
-    return "ftp1_univtac_finetune"
+        tag = _checkpoint_tag(deploy_config["checkpoint_dir"])
+    else:
+        tag = "ftp1_univtac_finetune"
+    mode, _ = _stream_settings(deploy_config)
+    return tag if mode == "normal" else f"{tag}-stream_{mode}"
 
 
 class Policy(BasePolicy):
@@ -142,6 +160,25 @@ class Policy(BasePolicy):
             raise RuntimeError(f"FTP-1 server failed to load a model for '{self.task_name}': {resp.text}")
         info = resp.json()
         self.action_rep = info["action_rep"]
+
+        # World-action model: optionally intervene on the jointly denoised stream tokens.
+        self.stream_ablation, self.stream_compare = _stream_settings(args)
+        self.prediction_streams = info.get("prediction_streams") or []
+        if (self.stream_ablation != "normal" or self.stream_compare) and not self.prediction_streams:
+            raise ValueError(
+                f"stream_ablation={self.stream_ablation!r} / stream_compare={self.stream_compare} need a checkpoint "
+                f"with prediction streams; {info['checkpoint_dir']} has none"
+            )
+        self._episode = 0
+        self._episode_stats = []
+        self._stream_log = None
+        if self.stream_compare:
+            log_dir = Path(args.get("stream_log_dir") or "eval_result/FTP1/stream_ablation")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            run_tag = get_run_tag(args)
+            self._stream_log = log_dir / f"{args['task_name']}-{run_tag}.jsonl"
+            self._run_started = time.strftime(r"%Y-%m-%d_%H:%M:%S")
+
         # eval_policy.py logs this dict after constructing the policy, so record what is
         # actually used instead of the yml's nulls.
         args.update(
@@ -149,18 +186,67 @@ class Policy(BasePolicy):
             use_wrist=self.use_wrist,
             checkpoint_dir=info["checkpoint_dir"],
             domain_name=info["domain_name"],
+            prediction_streams=self.prediction_streams,
+            stream_ablation=self.stream_ablation,
+            stream_compare=self.stream_compare,
         )
         print(
             f"[FTP1] {info['checkpoint_dir']} (domain={info['domain_name']}, action_rep={self.action_rep}, "
             f"horizon={info['action_horizon']}) | wrist={self.use_wrist} | prompt={self.prompt!r}",
             flush=True,
         )
+        if self.prediction_streams:
+            print(
+                f"[FTP1] prediction streams {self.prediction_streams} | stream_ablation={self.stream_ablation} | "
+                f"stream_compare={self.stream_compare} | log={self._stream_log}",
+                flush=True,
+            )
         self.reset()
 
     def reset(self):
+        if getattr(self, "_exec_step", 0) > 0:  # the previous episode ran; __init__'s reset is not one
+            self._flush_episode_stats()
+            self._episode += 1
         # (chunk8, exec step it was inferred at, qpos8 at that step)
         self._chunk_history = []
         self._exec_step = 0
+
+    def close(self):
+        # The model lives in ftp1_server.py, so there is nothing local to release.
+        self._flush_episode_stats()
+
+    def _record_stream_stats(self, chunk8: np.ndarray, resp: dict) -> None:
+        """Per inference: how far the executed chunk is from the unablated reference, over the voting steps."""
+        stats = {}
+        if "ref_chunk8" in resp:
+            end = CHUNK_INDEX_OFFSET + self.chunk_first_n if self.chunk_first_n > 0 else None
+            # Both chunks share action_rep and the qpos base, so their difference is the qpos difference.
+            diff = (chunk8 - resp["ref_chunk8"])[CHUNK_INDEX_OFFSET:end]
+            stats["arm_rmse"] = float(np.sqrt(np.mean(diff[:, :7] ** 2)))
+            stats["arm_rmse_step1"] = float(np.sqrt(np.mean(diff[0, :7] ** 2)))
+            stats["gripper_mae"] = float(np.mean(np.abs(diff[:, 7])))
+        if stats:
+            self._episode_stats.append(stats)
+
+    def _flush_episode_stats(self) -> None:
+        if not getattr(self, "_episode_stats", None):
+            return
+        stats, self._episode_stats = self._episode_stats, []
+        record = {
+            "run_started": self._run_started,
+            "episode": self._episode,
+            "stream_ablation": self.stream_ablation,
+            "num_infer": len(stats),
+        }
+        for key in ("arm_rmse", "arm_rmse_step1", "gripper_mae"):
+            values = [s[key] for s in stats if key in s]
+            if values:
+                record[f"{key}_mean"] = float(np.mean(values))
+                record[f"{key}_max"] = float(np.max(values))
+        with open(self._stream_log, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        summary = ", ".join(f"{k}={v:.4g}" for k, v in record.items() if k.endswith("_mean"))
+        print(f"[FTP1] episode {self._episode} stream_ablation={self.stream_ablation}: {summary}", flush=True)
 
     def _infer_chunk(self, observation, qpos8: np.ndarray) -> np.ndarray:
         payload = {
@@ -177,13 +263,21 @@ class Policy(BasePolicy):
         }
         if self.use_wrist:
             payload["wrist"] = _model_image(observation["observation"]["wrist"]["rgb"])
+        if self.prediction_streams:
+            payload.update(
+                stream_ablation=np.array(self.stream_ablation),
+                stream_compare=np.array(self.stream_compare),
+            )
         buf = io.BytesIO()
         np.savez(buf, **payload)
         resp = requests.post(f"{self.server_url}/infer", data=buf.getvalue(), timeout=self.request_timeout)
         if resp.status_code != 200:
             raise RuntimeError(f"FTP-1 inference failed: {resp.text}")
         with np.load(io.BytesIO(resp.content), allow_pickle=False) as npz:
-            return npz["chunk8"]
+            out = {k: npz[k] for k in npz.files}
+        if self._stream_log is not None:
+            self._record_stream_stats(out["chunk8"], out)
+        return out["chunk8"]
 
     def get_action(self, observation) -> np.ndarray:
         qpos8 = _get_qpos8(observation)

@@ -33,3 +33,14 @@ use_wrist: null
 # Re-infer every step and blend the overlapping predictions.
 chunk_first_n: 20         # only the first N executable steps of each chunk vote
 ensemble_K: 0.01          # weights exp(-K * i), oldest chunk first
+
+# --- world-action model (WAM) stream ablations ---------------------------------
+# Only for checkpoints with prediction streams (future tactile latents denoised jointly
+# with the actions); the server must import WAM model code (--openpi_src). See deploy_wam.yml.
+# normal | noise; overridable with FTP1_STREAM_ABLATION.
+stream_ablation: normal
+# true: also sample the unablated chunk from the same noise seed every step and log how far
+# the executed chunk is from it (per episode, to stream_log_dir). Doubles inference time.
+# Overridable with FTP1_STREAM_COMPARE.
+stream_compare: false
+stream_log_dir: null      # null: eval_result/FTP1/stream_ablation

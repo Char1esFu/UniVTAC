@@ -130,6 +130,86 @@ All of this follows how the checkpoints were trained
 | `instruction` | `null` | `null`: training prompt for the task |
 | `use_wrist` | `null` | `null`: wrist only for `insert_tube` / `lift_can` |
 | `chunk_first_n` / `ensemble_K` | `20` / `0.01` | temporal ensemble, as `eval_ftp1.sh` |
+| `stream_ablation` | `normal` | WAM checkpoints only, see [Stream-token ablation](#stream-token-ablation-world-action-model); also `FTP1_STREAM_ABLATION` |
+| `stream_compare` / `stream_log_dir` | `false` / `null` | log per-episode deviation from the unablated chunk; also `FTP1_STREAM_COMPARE` |
+
+---
+
+## Stream-token ablation (world-action model)
+
+A WAM checkpoint (`PREDICTION_STREAMS=tactile_latent:stride=8,horizon=32` in
+ftp1-policy's `slurm/train_univtac.sbatch`, experiment `..._wam`) denoises future
+tactile latents ("stream tokens", offsets +8/+16/+24/+32 action steps, one per pad)
+in the action-expert suffix together with the action chunk. Its gain over plain
+FTP-1 can come from two places:
+
+1. **Auxiliary training**: the latent loss shaped the shared weights. This stays in
+   the weights, so it survives any inference-time change to the stream tokens.
+2. **Conditioning at inference**: stream and action tokens share one bidirectional
+   attention block in the action expert, so at every denoising step the action tokens
+   attend to the current stream tokens, i.e. to the future the model imagines. This is
+   the part specific to joint denoising, and it disappears when the stream tokens are corrupted.
+
+Corrupting the stream tokens of a single checkpoint at inference separates the two
+(`stream_ablation`, applied by the server in a hook on `denoise_step`):
+
+| mode | stream tokens fed to the model at each denoising step |
+|---|---|
+| `normal` | jointly denoised, as in training |
+| `noise` | their initial Gaussian noise, every step (the stream update is discarded) |
+
+`noise` is out of distribution at small t (the shared time says "almost clean"), so if it
+hurts, that alone does not prove the actions use the stream *content*; add a control for
+that if needed.
+
+### Running it
+
+The WAM model code is only on the cluster (uncommitted in `~/Projects/ftp1-policy`), so
+snapshot its `src/` and let the server import it ahead of the uv project's own
+`openpi`. The uv env itself stays unchanged; the WAM diff does not touch
+`transformers_replace` or dependencies.
+
+```bash
+# code snapshot + checkpoint (no optimizer state)
+rsync -a --delete --exclude=__pycache__ alex:Projects/ftp1-policy/src/ ~/proj/ftp1-policy-wam/src/
+D=/home/atuin/g107ea/g107ea11/ftp1_cache/checkpoints/ftp1/UniVTAC_put_bottle_expert_gsmall_ftp1_wam
+rsync -a --partial --exclude=optimizer.pt alex:$D/14000 policy/FTP1/checkpoints/wam/UniVTAC_put_bottle_expert_gsmall_ftp1_wam/
+
+# terminal 1: the log shows "openpi from .../ftp1-policy-wam/src/openpi"
+uv run --project ~/proj/ftp1-policy python policy/FTP1/ftp1_server.py --openpi_src ~/proj/ftp1-policy-wam/src
+
+# terminal 2: one run per mode on the same seeds (deploy_wam.yml points at the checkpoint)
+for m in normal noise; do
+  FTP1_STREAM_ABLATION=$m CUDA_VISIBLE_DEVICES=0 python scripts/eval_policy.py \
+      put_bottle_in_shelf contact FTP1/deploy_wam --total_num 100 --start_seed 1000000
+done
+```
+
+Runs land in `eval_result/FTP1/put_bottle_in_shelf/deploy_wam/<ckpt>-<step>[-stream_<mode>]/`,
+so success rates per mode sit side by side. The server also accepts plain FTP-1
+checkpoints with `--openpi_src`, so the plain baseline (`deploy.yml`) can run on the same server.
+
+### Reading it
+
+`deploy_wam.yml` sets `stream_compare: true`: every step the server also samples the
+**unablated** chunk from the **same** noise seed, and the client logs how far the executed
+chunk is from it over the voting steps `chunk[1:21]`. Per episode, a line goes to
+`eval_result/FTP1/stream_ablation/<task>-<run_tag>.jsonl` (`arm_rmse_mean`, rad, plus
+`arm_rmse_step1_mean`, `gripper_mae_mean` and `_max` versions). This costs a second sampling pass
+per step, so turn it off for timing-sensitive runs.
+
+For `normal`, the reference uses a *different* seed instead, so its `arm_rmse` is the
+sampling-noise floor, the number to compare `noise` against:
+
+- **`noise` `arm_rmse` ≈ the `normal` floor and success rate unchanged**: the actions do not read
+  the stream tokens; the WAM gain (if any) is auxiliary training (1).
+- **`noise` well above the floor and success rate drops**: the actions depend on the stream tokens
+  (2), or are at least disturbed by noise there (see the caveat above).
+
+Offline (training-set) RMSE and per-offset prediction quality are on wandb already
+(`Validation/wm/tactile_latent_{pred,copy}_mse[_t+k]`). If `pred_mse` is not clearly below
+`copy_mse` ("future = current latent"), the streams carry little beyond the current tactile
+input, and a null result here is expected.
 
 ---
 
