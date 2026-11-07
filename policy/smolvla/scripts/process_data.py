@@ -113,6 +113,8 @@ class SmolVLADataPreprocessor(BaseDataPreprocessor):
         robot_type: str = "vitac_arm_left",
         use_videos: bool = True,
         overwrite: bool = True,
+        image_writer_processes: int = 0,
+        image_writer_threads: int = 0,
     ) -> dict:
         assert self._data is not None, "Data not loaded. Please call load_data() before export_to_lerobot()."
 
@@ -140,6 +142,8 @@ class SmolVLADataPreprocessor(BaseDataPreprocessor):
             root=out_root,
             robot_type=robot_type,
             use_videos=use_videos,
+            image_writer_processes=image_writer_processes,
+            image_writer_threads=image_writer_threads,
         )
 
         task_text = task_text or self._sample_instruction()
@@ -191,6 +195,8 @@ class SmolVLADataPreprocessor(BaseDataPreprocessor):
         random_select=False,
         overwrite=True,
         use_videos: bool = True,
+        image_writer_processes: int = 0,
+        image_writer_threads: int = 0,
     ) -> dict:
         self.load_data(
             visual_cameras=visual_cameras,
@@ -206,6 +212,8 @@ class SmolVLADataPreprocessor(BaseDataPreprocessor):
             task_text=task_text,
             overwrite=overwrite,
             use_videos=use_videos,
+            image_writer_processes=image_writer_processes,
+            image_writer_threads=image_writer_threads,
         )
 
     def visual_transform(self, images: np.ndarray) -> np.ndarray:
@@ -310,6 +318,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--task", type=str, default=None, help="Task description string.")
     p.add_argument("--downsample-factor", type=int, default=1)
     p.add_argument("--no-overwrite", action="store_true")
+    p.add_argument("--image-writer-processes", type=int, default=0,
+                   help="Subprocesses for parallel image encoding (0 = threads only).")
+    p.add_argument("--image-writer-threads", type=int, default=0,
+                   help="Threads (per process) for parallel image encoding; 0 with 0 processes = synchronous.")
     storage = p.add_mutually_exclusive_group()
     storage.add_argument("--images", action="store_true", help="Store visual modalities as image files. This is the default.")
     storage.add_argument("--videos", action="store_true", help="Store visual modalities as MP4 videos instead of image files.")
@@ -334,6 +346,8 @@ def main() -> None:
         episode_num=args.expert_data_num,
         overwrite=not args.no_overwrite,
         use_videos=args.videos,
+        image_writer_processes=args.image_writer_processes,
+        image_writer_threads=args.image_writer_threads,
     )
 
     log.info("LeRobot repo_id: %s", metadata["repo_id"])

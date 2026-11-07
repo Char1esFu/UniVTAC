@@ -224,11 +224,18 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
-            try:
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            # datasets>=4: hf_dataset[key][indices] materializes whole rows, decoding
+            # every image column. A cached single-column view reads only `key`.
+            result[key] = torch.stack(self._column_view(key)[relative_indices][key])
         return result
+
+    def _column_view(self, key: str):
+        cache = self.__dict__.setdefault("_column_views", {})
+        cached = cache.get(key)
+        if cached is None or cached[0] is not self.hf_dataset:
+            cached = (self.hf_dataset, self.hf_dataset.select_columns([key]))
+            cache[key] = cached
+        return cached[1]
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
