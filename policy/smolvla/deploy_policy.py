@@ -121,6 +121,25 @@ def _get_policy_config(model):
 # Local model implementation used by the FastAPI service
 # ---------------------------------------------------------------------------
 
+
+def _instruction_for(instruction: str | None, task_name: str, use_env_instruction: bool = False) -> str:
+    """Language prompt for the policy.
+
+    scripts/process_data.py labels every frame with _task_string_from_name
+    (e.g. lift_bottle -> "lift the bottle") unless policy/instructions/ exists,
+    so by default the env's instruction is ignored: eval_policy.py passes
+    "Empty" and parallel_eval_policy.py a sentence from instructions/*.json
+    that the model never saw. Set smolvla_use_env_instruction: true for a
+    checkpoint trained on those instructions.
+    """
+    if use_env_instruction and instruction and instruction != "Empty":
+        return instruction
+    words = task_name.replace("-", "_").split("_")
+    if len(words) >= 2:
+        return f"{words[0]} the {' '.join(words[1:])}"
+    return task_name.replace("_", " ")
+
+
 class _SmolVLALocalPolicy(BasePolicy):
     """SmolVLA model runner. This class is instantiated only in .venv service."""
 
@@ -162,6 +181,7 @@ class _SmolVLALocalPolicy(BasePolicy):
         self.train_config_name = os.environ.get("TRAIN_CONFIG", "train_config")
         self.ep_num = os.environ.get("EP_NUM", "50")
         self.task_name = args["task_name"]
+        self.use_env_instruction = bool(args.get("smolvla_use_env_instruction", False))
 
         # Checkpoint layout mirrors ACT:
         #   policy/smolvla/smolvla_ckpt/smolvla-<task_name>/<task_config>-<ep_num>/<train_config>/
@@ -175,7 +195,10 @@ class _SmolVLALocalPolicy(BasePolicy):
         with open(_SMOLVLA_DIR.parent / "task_settings.json", "r") as f:
             task_settings = json.load(f)
         assert self.task_name in task_settings, f"Task '{self.task_name}' not found in task_settings.json"
-        self.camera_type = task_settings[self.task_name].get("camera_type", "head")
+        # task_settings.json's camera_type is the ACT recipe (head-only for most
+        # tasks). SmolVLA feeds every camera the checkpoint was trained on
+        # (see _image_map); dropping one leaves it out of distribution.
+        self.camera_type = args.get("smolvla_camera_type", "all")
         print(f"[smolvla] camera_type='{self.camera_type}' task='{self.task_name}'")
 
         # ------------------------------------------------------------------ deploy config
@@ -456,7 +479,9 @@ class _SmolVLALocalPolicy(BasePolicy):
         import torch
 
         if not self._instruction_set:
-            self._cached_instruction = task.instruction or self.task_name.replace("_", " ")
+            self._cached_instruction = _instruction_for(
+                task.instruction, self.task_name, self.use_env_instruction
+            )
             self.model.reset()
             self._instruction_set = True
 
@@ -686,9 +711,21 @@ class Policy(BasePolicy):
 
     def __init__(self, args: dict):
         self.task_name = args["task_name"]
+        self.use_env_instruction = bool(args.get("smolvla_use_env_instruction", False))
         self.model = _SmolVLAFastAPIClient(args)
         self._instruction_set = False
         self._cached_instruction: str | None = None
+        # Optional gripper snap: a predicted finger qpos below the threshold
+        # (i.e. "close") is replaced by a fixed grasp qpos. The demos hold the
+        # bottle at 0.00853-0.00889 m, so small prediction errors leave the
+        # grasp loose. null disables it.
+        snap = args.get("smolvla_gripper_close_threshold")
+        self.gripper_close_threshold = None if snap is None else float(snap)
+        self.gripper_close_value = float(args.get("smolvla_gripper_close_value", 0.0085))
+        self.gripper_log_every = int(args.get("smolvla_gripper_log_every", 10))
+        self._step = 0
+        print(f"[smolvla] gripper snap threshold={self.gripper_close_threshold} "
+              f"value={self.gripper_close_value}")
 
     def encode_obs(self, observation: dict) -> dict:
         return observation
@@ -697,15 +734,34 @@ class Policy(BasePolicy):
         import torch
 
         if not self._instruction_set:
-            self._cached_instruction = task.instruction or self.task_name.replace("_", " ")
+            self._cached_instruction = _instruction_for(
+                task.instruction, self.task_name, self.use_env_instruction
+            )
             self._instruction_set = True
 
         action_np = self.model.get_action(observation, self._cached_instruction).reshape(-1)
+        # Trained on embodiment/joint: 7 arm joints + 2 mirrored finger joints.
+        # take_action("qpos") expects 7 arm joints + 1 gripper value (as ACT's [:8]).
+        action_np = action_np[:8].copy()
+        pred_grip = float(action_np[7])
+        if self.gripper_close_threshold is not None and pred_grip < self.gripper_close_threshold:
+            action_np[7] = self.gripper_close_value
+        if self.gripper_log_every > 0 and self._step % self.gripper_log_every == 0:
+            meas = float(observation["embodiment"]["joint"][7])
+            try:  # gel depth in mm; expert's adaptive grasp stops below its threshold
+                depth = task._tactile_manager.get_min_depth().reshape(-1).tolist()
+                depth = "/".join(f"{d:.2f}" for d in depth)
+            except Exception:
+                depth = "n/a"
+            print(f"[smolvla-grip] t={self._step} pred={pred_grip:.5f} "
+                  f"cmd={float(action_np[7]):.5f} meas={meas:.5f} depth={depth}", flush=True)
+        self._step += 1
         action_t = torch.from_numpy(action_np).to(task.device).float()
         exec_succ, eval_succ = task.take_action(action_t, action_type="qpos")
         return exec_succ, eval_succ
 
     def reset(self):
+        self._step = 0
         self._instruction_set = False
         self._cached_instruction = None
         self.model.reset()

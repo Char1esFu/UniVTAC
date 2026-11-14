@@ -113,7 +113,11 @@ class SmolVLMWithExpertModel(nn.Module):
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
+        # The expert is trained. text_config carries the VLM's bfloat16 dtype and
+        # transformers>=5 builds the model in it, so AdamW would update bf16
+        # weights directly and small updates would round away. Keep it fp32;
+        # the frozen VLM stays bf16.
+        self.lm_expert = AutoModel.from_config(lm_expert_config, dtype=torch.float32)
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
