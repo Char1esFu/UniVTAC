@@ -87,3 +87,20 @@ Training:
 - In the log, `data_s` should stay well below `updt_s` (about 0.09 s/step on
   an RTX 4090 at batch size 8). If it does not, data loading is the
   bottleneck.
+
+## Eval
+
+Run from the repo root in the IsaacLab env. `deploy.yml` holds the deploy
+parameters for every task; the checkpoint is picked from the environment:
+
+```bash
+TRAIN_CONFIG=fp32_scratch EP_NUM=100 \
+    python scripts/eval_policy.py lift_bottle clean smolvla/deploy --headless
+```
+
+- The checkpoint is
+  `outputs/smolvla_vitac_{task}-{task_config}-{EP_NUM}_{TRAIN_CONFIG}/checkpoints/last/pretrained_model`,
+  i.e. the suffix after `{EP_NUM}_` in the training `RUN_TAG`. Defaults:
+  `TRAIN_CONFIG=vitac` (what `scripts/train.sh` writes without `RUN_TAG`),
+  `EP_NUM=100`. A `ckpt_dir` in the deploy args overrides this.
+- Results go to `eval_result/smolvla/{task}/deploy/{TRAIN_CONFIG}/{time}/`.

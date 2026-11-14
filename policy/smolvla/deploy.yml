@@ -38,6 +38,6 @@ smolvla_use_marker_variants: auto
 # to connect to an already-running service instead.
 # smolvla_python: policy/smolvla/.venv/bin/python
 # smolvla_host: 127.0.0.1
-smolvla_port: 10700
+smolvla_port: 0
 # smolvla_startup_timeout: 300
 # smolvla_request_timeout: 300

@@ -7,3 +7,5 @@
 /.venv
 /uv.lock
 /outputs
+# Training / processing logs written by `... | tee *.log` (see README)
+*.log

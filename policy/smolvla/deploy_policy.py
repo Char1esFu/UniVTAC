@@ -140,6 +140,23 @@ def _instruction_for(instruction: str | None, task_name: str, use_env_instructio
     return task_name.replace("_", " ")
 
 
+def get_run_tag(args: dict) -> str:
+    """Run suffix that names both the checkpoint and the eval result dir.
+
+    scripts/train.sh writes outputs/smolvla_vitac_{task}-{config}-{num}_{RUN_TAG suffix},
+    "vitac" by default. Select another run with TRAIN_CONFIG (e.g. fp32_scratch).
+    """
+    return args.get("train_config_name") or os.environ.get("TRAIN_CONFIG") or "vitac"
+
+
+def _resolve_ckpt_dir(args: dict) -> Path:
+    if args.get("ckpt_dir"):
+        return Path(args["ckpt_dir"])
+    ep_num = args.get("expert_data_num") or os.environ.get("EP_NUM") or "100"
+    run = f"smolvla_vitac_{args['task_name']}-{args['task_config']}-{ep_num}_{get_run_tag(args)}"
+    return _SMOLVLA_DIR / "outputs" / run / "checkpoints" / "last" / "pretrained_model"
+
+
 class _SmolVLALocalPolicy(BasePolicy):
     """SmolVLA model runner. This class is instantiated only in .venv service."""
 
@@ -178,18 +195,14 @@ class _SmolVLALocalPolicy(BasePolicy):
         )
 
         # ------------------------------------------------------------------ env
-        self.train_config_name = os.environ.get("TRAIN_CONFIG", "train_config")
-        self.ep_num = os.environ.get("EP_NUM", "50")
         self.task_name = args["task_name"]
         self.use_env_instruction = bool(args.get("smolvla_use_env_instruction", False))
 
-        # Checkpoint layout mirrors ACT:
-        #   policy/smolvla/smolvla_ckpt/smolvla-<task_name>/<task_config>-<ep_num>/<train_config>/
-        ckpt_dir = (
-            _SMOLVLA_DIR / args.get('ckpt_root', 'outputs/smolvla_vitac_merged')
-            / "checkpoints/last/pretrained_model"
-        )
-        ckpt_dir = Path(args.get("ckpt_dir", ckpt_dir))
+        ckpt_dir = _resolve_ckpt_dir(args)
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(
+                f"SmolVLA checkpoint not found: {ckpt_dir} (set TRAIN_CONFIG / EP_NUM, or ckpt_dir)"
+            )
 
         # ------------------------------------------------------------------ task settings
         with open(_SMOLVLA_DIR.parent / "task_settings.json", "r") as f:
@@ -202,10 +215,7 @@ class _SmolVLALocalPolicy(BasePolicy):
         print(f"[smolvla] camera_type='{self.camera_type}' task='{self.task_name}'")
 
         # ------------------------------------------------------------------ deploy config
-        deploy_yml = _SMOLVLA_DIR / f"{self.train_config_name}.yml"
-        if not deploy_yml.exists():
-            deploy_yml = _SMOLVLA_DIR / "deploy.yml"
-        with open(deploy_yml, "r") as f:
+        with open(_SMOLVLA_DIR / "deploy.yml", "r") as f:
             cfg = yaml.safe_load(f) or {}
 
         # Allow caller / env to override the on-disk yaml.
@@ -715,17 +725,6 @@ class Policy(BasePolicy):
         self.model = _SmolVLAFastAPIClient(args)
         self._instruction_set = False
         self._cached_instruction: str | None = None
-        # Optional gripper snap: a predicted finger qpos below the threshold
-        # (i.e. "close") is replaced by a fixed grasp qpos. The demos hold the
-        # bottle at 0.00853-0.00889 m, so small prediction errors leave the
-        # grasp loose. null disables it.
-        snap = args.get("smolvla_gripper_close_threshold")
-        self.gripper_close_threshold = None if snap is None else float(snap)
-        self.gripper_close_value = float(args.get("smolvla_gripper_close_value", 0.0085))
-        self.gripper_log_every = int(args.get("smolvla_gripper_log_every", 10))
-        self._step = 0
-        print(f"[smolvla] gripper snap threshold={self.gripper_close_threshold} "
-              f"value={self.gripper_close_value}")
 
     def encode_obs(self, observation: dict) -> dict:
         return observation
@@ -743,25 +742,11 @@ class Policy(BasePolicy):
         # Trained on embodiment/joint: 7 arm joints + 2 mirrored finger joints.
         # take_action("qpos") expects 7 arm joints + 1 gripper value (as ACT's [:8]).
         action_np = action_np[:8].copy()
-        pred_grip = float(action_np[7])
-        if self.gripper_close_threshold is not None and pred_grip < self.gripper_close_threshold:
-            action_np[7] = self.gripper_close_value
-        if self.gripper_log_every > 0 and self._step % self.gripper_log_every == 0:
-            meas = float(observation["embodiment"]["joint"][7])
-            try:  # gel depth in mm; expert's adaptive grasp stops below its threshold
-                depth = task._tactile_manager.get_min_depth().reshape(-1).tolist()
-                depth = "/".join(f"{d:.2f}" for d in depth)
-            except Exception:
-                depth = "n/a"
-            print(f"[smolvla-grip] t={self._step} pred={pred_grip:.5f} "
-                  f"cmd={float(action_np[7]):.5f} meas={meas:.5f} depth={depth}", flush=True)
-        self._step += 1
         action_t = torch.from_numpy(action_np).to(task.device).float()
         exec_succ, eval_succ = task.take_action(action_t, action_type="qpos")
         return exec_succ, eval_succ
 
     def reset(self):
-        self._step = 0
         self._instruction_set = False
         self._cached_instruction = None
         self.model.reset()
