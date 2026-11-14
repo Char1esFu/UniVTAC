@@ -18,6 +18,20 @@ smolvla_temporal_agg_max_timesteps: 1000
 smolvla_temporal_agg_action_dim: 9
 smolvla_temporal_agg_k: 0.01
 
+# Execution (default: RTC, replan every 10 actions). 0: predict a chunk every
+# step and average the overlapping predictions (temporal aggregation above;
+# 0/20 vs 9/20 for RTC10 on lift_bottle, 2026-11-14). n > 0: execute the first
+# n actions of each chunk, then predict again. The env var SMOLVLA_REPLAN_EVERY
+# overrides this; results go to deploy/{TRAIN_CONFIG}-rtc{n}/ or -replan{n}/.
+smolvla_replan_every: 10
+# Real-Time Chunking (synchronous, inference delay 0): when replanning, guide
+# the new chunk towards the unexecuted rest of the previous one so chunks join
+# up. Needs smolvla_replan_every > 0. Env var SMOLVLA_RTC=1 overrides; results
+# then go to deploy/{TRAIN_CONFIG}-rtc{n}/.
+smolvla_rtc: true
+smolvla_rtc_max_guidance_weight: 10.0
+smolvla_rtc_schedule: LINEAR
+
 # Input image / tactile sizes. SmolVLA's own resize_imgs_with_padding kicks in
 # afterwards, so values here just standardize what we feed the processor.
 # Leave null to use the checkpoint input feature shape, typically [256, 256].

@@ -167,6 +167,58 @@ class SmolVLAConfig(PreTrainedConfig):
     vitac_pretrained_path: str | None = None
     vitac_freeze_backbone: bool = False
 
+    # ---------------------------------------------------------------------
+    # World action model (UWM-style joint denoising of future latents)
+    # ---------------------------------------------------------------------
+    # Latents: frozen SigLIP+connector features of the cameras in
+    # ``wam_vision_keys`` and frozen pretrained UniVTAC backbone features of
+    # the streams in ``tactile_keys`` (scripts/precompute_wam_latents.py).
+    # The action expert sees an observation window of past latents (clean) and
+    # denoises the latents of several future frames together with the action
+    # chunk; each modality has its own flow time.
+    wam_enabled: bool = False
+    wam_use_vision: bool = True
+    wam_use_tactile: bool = True
+    wam_vision_keys: tuple[str, ...] = (
+        "observation.images.head",
+        "observation.images.wrist",
+    )
+    # Output of scripts/precompute_wam_latents.py (<dataset root>/wam_latents);
+    # used for training only, inference encodes the frames online.
+    wam_latent_dir: str | None = None
+    # Observation window: ``wam_history`` frames, ``wam_history_stride`` frames
+    # apart, ending at the current frame (1 = current frame only).
+    wam_history: int = 2
+    wam_history_stride: int = 1
+    # Predicted future frames: ``steps`` frames, ``stride`` frames apart, i.e.
+    # offsets stride, 2*stride, ..., steps*stride (0 steps = no prediction).
+    wam_vision_future_stride: int = 5
+    wam_vision_future_steps: int = 6
+    wam_tactile_future_stride: int = 5
+    wam_tactile_future_steps: int = 6
+    # The connector's 8x8 token grid is average-pooled to this grid per camera.
+    wam_vision_pool: tuple[int, int] = (2, 2)
+    # Tactile latents follow ``vitac_freeze_backbone``, so one encoder serves the
+    # whole modality. Frozen: the prefix, the window and the targets all use the
+    # frozen pretrained backbone, and window/targets are read from the
+    # precomputed latents. Fine-tuned: the prefix and the window use the
+    # fine-tuned backbone (window encoded online), and the targets use an EMA
+    # copy of it, updated after every optimizer step (a target encoder trained
+    # by the prediction loss itself could collapse to a constant).
+    wam_tactile_ema_decay: float = 0.999
+    wam_vision_loss_weight: float = 1.0
+    wam_tactile_loss_weight: float = 1.0
+    # Probability of training a sample with every future latent at pure noise
+    # (tau = 1), the condition used by wam_inference_mode="marginal".
+    wam_marginal_prob: float = 0.1
+    # "joint": future latents are denoised together with the actions.
+    # "marginal": future latents stay pure noise; only the actions are denoised.
+    wam_inference_mode: str = "joint"
+    # False: future-latent tokens see the context but not the action tokens,
+    # and the action tokens keep their causal mask plus see the future latents.
+    # True: future-latent tokens also attend to the (noisy) action tokens.
+    wam_obs_attend_actions: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -180,6 +232,21 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.wam_enabled:
+            if self.wam_inference_mode not in ("joint", "marginal"):
+                raise ValueError(f"wam_inference_mode must be 'joint' or 'marginal', got {self.wam_inference_mode!r}")
+            if self.wam_history < 1 or self.wam_history_stride < 1:
+                raise ValueError("wam_history and wam_history_stride must be >= 1")
+            if min(self.wam_vision_future_stride, self.wam_tactile_future_stride) < 1:
+                raise ValueError("wam_*_future_stride must be >= 1")
+            if min(self.wam_vision_future_steps, self.wam_tactile_future_steps) < 0:
+                raise ValueError("wam_*_future_steps must be >= 0")
+            if self.wam_use_tactile and not (
+                self.use_tactile and (self.vitac_encoder_name or "").lower() == "univtac"
+            ):
+                raise ValueError("wam_use_tactile needs use_tactile=True and vitac_encoder_name='univtac'")
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise NotImplementedError("RTC is not supported together with wam_enabled")
 
     def validate_features(self) -> None:
         # Keep only the selected tactile streams; the dataset also carries the
@@ -225,6 +292,30 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> list:
         return [0]
+
+    def observation_delta_indices_for(self, key: str) -> list:
+        """Per-key frame offsets. Only the online (non-frozen) tactile WAM path
+        loads extra frames: its streams at the window and future offsets."""
+        if (
+            self.wam_enabled
+            and self.wam_use_tactile
+            and not self.vitac_freeze_backbone
+            and key in self.tactile_keys
+        ):
+            return sorted(set(self.wam_history_offsets) | set(self.wam_future_offsets("tactile")))
+        return self.observation_delta_indices
+
+    @property
+    def wam_history_offsets(self) -> list[int]:
+        """Frame offsets of the observation window, oldest first, ending at 0."""
+        return [-i * self.wam_history_stride for i in range(self.wam_history - 1, -1, -1)]
+
+    def wam_future_offsets(self, modality: str) -> list[int]:
+        if modality == "vision":
+            stride, steps = self.wam_vision_future_stride, self.wam_vision_future_steps
+        else:
+            stride, steps = self.wam_tactile_future_stride, self.wam_tactile_future_steps
+        return [stride * (i + 1) for i in range(steps)]
 
     @property
     def action_delta_indices(self) -> list:

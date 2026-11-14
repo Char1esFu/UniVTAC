@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 import base64
 import secrets
 import socket
@@ -140,20 +141,41 @@ def _instruction_for(instruction: str | None, task_name: str, use_env_instructio
     return task_name.replace("_", " ")
 
 
-def get_run_tag(args: dict) -> str:
-    """Run suffix that names both the checkpoint and the eval result dir.
-
-    scripts/train.sh writes outputs/smolvla_vitac_{task}-{config}-{num}_{RUN_TAG suffix},
-    "vitac" by default. Select another run with TRAIN_CONFIG (e.g. fp32_scratch).
-    """
+def _train_config_name(args: dict) -> str:
+    """scripts/train.sh writes outputs/smolvla_vitac_{task}-{config}-{num}_{RUN_TAG suffix},
+    "vitac" by default. Select another run with TRAIN_CONFIG (e.g. fp32_scratch)."""
     return args.get("train_config_name") or os.environ.get("TRAIN_CONFIG") or "vitac"
+
+
+def _replan_every(args: dict) -> int:
+    """0: predict a chunk every step and average overlapping predictions (temporal
+    aggregation). n > 0: execute the first n actions of a chunk, then predict again.
+    SMOLVLA_REPLAN_EVERY overrides smolvla_replan_every from the deploy yml."""
+    return int(os.environ.get("SMOLVLA_REPLAN_EVERY") or args.get("smolvla_replan_every") or 0)
+
+
+def _use_rtc(args: dict) -> bool:
+    """Real-Time Chunking guidance between consecutive chunks (needs replan_every > 0).
+    SMOLVLA_RTC=1/0 overrides smolvla_rtc from the deploy yml."""
+    env = os.environ.get("SMOLVLA_RTC")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes")
+    return bool(args.get("smolvla_rtc", False))
+
+
+def get_run_tag(args: dict) -> str:
+    """Name of the eval result dir: the checkpoint run, plus the execution mode if not the default."""
+    n = _replan_every(args)
+    if n <= 0:
+        return _train_config_name(args)
+    return _train_config_name(args) + (f"-rtc{n}" if _use_rtc(args) else f"-replan{n}")
 
 
 def _resolve_ckpt_dir(args: dict) -> Path:
     if args.get("ckpt_dir"):
         return Path(args["ckpt_dir"])
     ep_num = args.get("expert_data_num") or os.environ.get("EP_NUM") or "100"
-    run = f"smolvla_vitac_{args['task_name']}-{args['task_config']}-{ep_num}_{get_run_tag(args)}"
+    run = f"smolvla_vitac_{args['task_name']}-{args['task_config']}-{ep_num}_{_train_config_name(args)}"
     return _SMOLVLA_DIR / "outputs" / run / "checkpoints" / "last" / "pretrained_model"
 
 
@@ -232,6 +254,19 @@ class _SmolVLALocalPolicy(BasePolicy):
         self.temporal_agg_max_timesteps = int(cfg.get("smolvla_temporal_agg_max_timesteps", 1000))
         self.temporal_agg_action_dim = int(cfg.get("smolvla_temporal_agg_action_dim", 9))
         self.temporal_agg_k = float(cfg.get("smolvla_temporal_agg_k", 0.01))
+        self.replan_every = _replan_every(cfg)
+        self.use_rtc = _use_rtc(cfg)
+        if self.use_rtc and self.replan_every <= 0:
+            raise ValueError("smolvla_rtc needs smolvla_replan_every > 0")
+        self.rtc_max_guidance_weight = float(cfg.get("smolvla_rtc_max_guidance_weight", 10.0))
+        self.rtc_schedule = str(cfg.get("smolvla_rtc_schedule", "LINEAR")).upper()
+        self._action_queue: deque = deque()
+        self._prev_chunk = None  # last chunk in model (normalized) space, for RTC
+        print(f"[smolvla] execution: " + (
+            (f"first {self.replan_every} actions per chunk"
+             + (f", RTC guidance (max weight {self.rtc_max_guidance_weight}, {self.rtc_schedule})" if self.use_rtc else ""))
+            if self.replan_every > 0
+            else f"temporal aggregation every step (k={self.temporal_agg_k})"))
 
         # ------------------------------------------------------------------ model + processors
         print(f"[smolvla] loading policy from {ckpt_dir}")
@@ -288,6 +323,18 @@ class _SmolVLALocalPolicy(BasePolicy):
             self.model_config.n_action_steps = min(
                 self.n_action_steps, self.model_config.chunk_size
             )
+
+        if self.use_rtc:
+            from lerobot.configs.types import RTCAttentionSchedule
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+            self.model_config.rtc_config = RTCConfig(
+                enabled=True,
+                prefix_attention_schedule=RTCAttentionSchedule[self.rtc_schedule],
+                max_guidance_weight=self.rtc_max_guidance_weight,
+                execution_horizon=self.model_config.chunk_size - self.replan_every,
+            )
+            self.model.init_rtc_processor()
 
         preprocessor_config = ckpt_dir / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
         postprocessor_config = ckpt_dir / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
@@ -502,11 +549,7 @@ class _SmolVLALocalPolicy(BasePolicy):
         # device-places, normalizes state).
         batch = self.pre(batch)
 
-        with torch.no_grad():
-            action_chunk = self.model.predict_action_chunk(batch)
-
-        action_chunk = self.post(action_chunk)
-        action_np = self._aggregate_action_chunk(action_chunk)
+        action_np = self._next_action(batch)
 
         action_t = torch.from_numpy(action_np).to(task.device).float()
         # SmolVLA action is the next-step joint pose; UniVTAC uses 'qpos' for joint targets.
@@ -526,17 +569,44 @@ class _SmolVLALocalPolicy(BasePolicy):
         batch["task"] = self._cached_instruction
         batch = self.pre(batch)
 
-        with torch.no_grad():
-            action_chunk = self.model.predict_action_chunk(batch)
+        return self._next_action(batch)
 
-        action_chunk = self.post(action_chunk)
-        return self._aggregate_action_chunk(action_chunk)
+    def _next_action(self, batch) -> np.ndarray:
+        """Action for this step: temporal aggregation, or the next queued action of the last chunk.
+
+        With RTC (synchronous, inference delay 0) the new chunk is guided towards
+        the part of the previous chunk that was not executed, so consecutive
+        chunks join up instead of jumping at the switch.
+        """
+        import torch
+
+        if self.replan_every > 0 and self._action_queue:
+            return self._action_queue.popleft()
+        kwargs = {}
+        if self.use_rtc and self._prev_chunk is not None:
+            left_over = self._prev_chunk[:, self.replan_every :]
+            kwargs = {
+                "inference_delay": 0,
+                "prev_chunk_left_over": left_over,
+                "execution_horizon": left_over.shape[1],
+            }
+        with torch.no_grad():  # RTC re-enables grad internally for its guidance term
+            raw_chunk = self.model.predict_action_chunk(batch, **kwargs)
+        self._prev_chunk = raw_chunk.detach()
+        action_chunk = self.post(raw_chunk.detach())
+        if self.replan_every <= 0:
+            return self._aggregate_action_chunk(action_chunk)
+        chunk = torch.as_tensor(action_chunk, dtype=torch.float32).reshape(-1, self.temporal_agg_action_dim)
+        self._action_queue.extend(a.cpu().numpy() for a in chunk[: self.replan_every])
+        return self._action_queue.popleft()
 
     def reset(self):
         """Reset SmolVLA's internal action queue and clear cached instruction."""
         self._instruction_set = False
         self._cached_instruction = None
         self._reset_temporal_aggregation()
+        self._action_queue.clear()
+        self._prev_chunk = None
         if hasattr(self.model, "reset"):
             self.model.reset()
 

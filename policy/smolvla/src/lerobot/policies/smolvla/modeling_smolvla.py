@@ -52,10 +52,14 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import copy
+import json
 import math
 from collections import deque
+from pathlib import Path
 from typing import TypedDict, Unpack
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -254,6 +258,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # World action model: latents of the frames seen so far (one per call).
+        self._wam_buffer = deque(maxlen=1 - min(self.config.wam_history_offsets, default=0))
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -292,10 +298,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        wam_window = self._wam_window(batch) if self.config.wam_enabled else None
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state,
             tactile_images=tactile_images, tactile_masks=tactile_masks,
-            noise=noise, **kwargs
+            noise=noise, wam_window=wam_window, **kwargs
         )
 
         # Unpad actions
@@ -387,7 +394,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
             tactile_images=tactile_images, tactile_masks=tactile_masks,
+            wam_batch=self.prepare_wam_batch(batch),
         )
+        wam_losses = {}
+        if self.config.wam_enabled:
+            losses, wam_losses = losses
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -401,6 +412,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        # World-action-model terms: each modality is averaged on its own (over
+        # its tokens and the samples whose future frame lies inside the
+        # episode), then weighted, so token counts do not set its share.
+        wam_weights = {
+            "vision": self.config.wam_vision_loss_weight,
+            "tactile": self.config.wam_tactile_loss_weight,
+        }
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over valid (time, action) entries
             if actions_is_pad is None:
@@ -408,6 +427,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            loss_dict["action_loss"] = per_sample_loss.mean().item()
+            for name, (sample_loss, sample_valid) in wam_losses.items():
+                per_sample_loss = per_sample_loss + wam_weights[name] * sample_loss * sample_valid
+                loss_dict[f"wam_{name}_loss"] = (
+                    (sample_loss * sample_valid).sum() / sample_valid.sum().clamp_min(1)
+                ).item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -417,6 +442,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
+            loss_dict["action_loss"] = loss.item()
+            for name, (sample_loss, sample_valid) in wam_losses.items():
+                wam_loss = (sample_loss * sample_valid).sum() / sample_valid.sum().clamp_min(1)
+                loss = loss + wam_weights[name] * wam_loss
+                loss_dict[f"wam_{name}_loss"] = wam_loss.item()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -455,7 +485,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         # Preprocess image features present in the batch
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            img = self._current_frame(batch, key)
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -511,7 +541,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        state = batch[OBS_STATE][:, 0, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
@@ -541,9 +571,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for key in self.config.tactile_keys:
             if key not in batch:
                 continue
-            img = batch[key]
-            if img.ndim == 5:
-                img = img[:, -1, :, :, :]
+            img = self._current_frame(batch, key)
             bsize = img.shape[0]
             device = img.device
             tactile_images.append(img)
@@ -553,6 +581,63 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
             tactile_masks.append(mask)
         return tactile_images, tactile_masks
+
+    def _current_frame(self, batch, key):
+        """Offset-0 frame of an observation that may carry extra offsets (WAM online tactile)."""
+        x = batch[key]
+        if x.ndim != 5:
+            return x
+        offsets = self.config.observation_delta_indices_for(key)
+        return x[:, offsets.index(0) if len(offsets) == x.shape[1] else 0]
+
+    def prepare_wam_batch(self, batch):
+        """Inputs of the world-action-model latents for a training batch (None when off).
+
+        Latents come from the precomputed store by global frame ``index``; the
+        online tactile mode also passes the tactile frames at their loaded
+        offsets (window and future) with their ``_is_pad`` masks.
+        """
+        if not self.config.wam_enabled:
+            return None
+        if "index" not in batch:
+            raise KeyError("world action model training needs the dataset 'index' in the batch")
+        out = {"index": batch["index"].reshape(-1)}
+        if self.config.wam_use_tactile and not self.config.vitac_freeze_backbone:
+            out["tactile_offsets"] = self.config.observation_delta_indices_for(self.config.tactile_keys[0])
+            out["tactile_frames"] = {k: batch[k] for k in self.config.tactile_keys}
+            out["tactile_is_pad"] = {k: batch[f"{k}_is_pad"] for k in self.config.tactile_keys}
+        return out
+
+    @torch.no_grad()
+    def _wam_window(self, batch):
+        """Inference observation window: latents of the last frames seen by this policy.
+
+        One entry is appended per call (the deploy runs one call per env step);
+        before the window is full the oldest frame repeats, as the training
+        window is clamped at the episode start.
+        """
+        vision, tactile = [], []
+        if self.config.wam_use_vision:
+            for key in self.config.wam_vision_keys:
+                img = self._current_frame(batch, key)
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                vision.append(img * 2.0 - 1.0)
+        if self.config.wam_use_tactile:
+            tactile = [self._current_frame(batch, key) for key in self.config.tactile_keys]
+        self._wam_buffer.append(self.model.wam_current_raw(vision, tactile))
+        last = len(self._wam_buffer) - 1
+        steps = [max(0, last + o) for o in self.config.wam_history_offsets]
+        raw = {
+            name: torch.stack([self._wam_buffer[i][name] for i in steps], dim=1)
+            for name in self._wam_buffer[last]
+        }
+        return self.model.wam_window_from_raw(raw)
+
+    def update(self):
+        """Called by the trainer after each optimizer step: EMA of the tactile target."""
+        if self.config.wam_enabled:
+            self.model.update_wam_ema()
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -611,6 +696,44 @@ def pad_tensor(tensor, max_len, pad_value=0):
     padded_tensor[:, :d] = tensor  # Efficient in-place copy
 
     return padded_tensor
+
+
+class _WAMLatentStore:
+    """Memory-mapped latents written by scripts/precompute_wam_latents.py, rows = global frame index."""
+
+    def __init__(self, latent_dir: str | Path, keys: list[str]):
+        latent_dir = Path(latent_dir)
+        self.info = json.loads((latent_dir / "info.json").read_text())
+        self.arrays = {k: np.load(latent_dir / f"{k}.npy", mmap_mode="r") for k in keys}
+        frames = np.load(latent_dir / "frames.npz")
+        self.episode_from = frames["episode_from"]
+        self.episode_to = frames["episode_to"]
+
+    def check(self, config: SmolVLAConfig, tactile: bool) -> None:
+        """The latents must come from the encoders and input sizes the policy uses."""
+        expected = {"vlm": config.vlm_model_name, "image_size": config.resize_imgs_with_padding[0]}
+        if tactile:
+            expected |= {
+                "vitac_ckpt": config.vitac_pretrained_path,
+                "tactile_size": tuple(config.vitac_input_size)[0],
+            }
+        wrong = {k: (self.info.get(k), v) for k, v in expected.items() if self.info.get(k) != v}
+        if wrong:
+            raise ValueError(f"precomputed latents do not match the policy config (stored, expected): {wrong}")
+
+    def gather(self, index: np.ndarray, offsets: list[int], keys) -> tuple[dict, np.ndarray]:
+        """Latents at ``index + offsets`` clamped to each sample's episode.
+
+        Returns key -> (B, len(offsets), ...) arrays and valid (B, len(offsets)),
+        False where the offset falls outside the episode.
+        """
+        frame = index[:, None] + np.asarray(offsets, dtype=np.int64)[None, :]
+        lo = self.episode_from[index][:, None]
+        hi = self.episode_to[index][:, None] - 1
+        valid = (frame >= lo) & (frame <= hi)
+        flat = np.clip(frame, lo, hi).reshape(-1)
+        out = {k: np.asarray(self.arrays[k][flat]).reshape(*frame.shape, *self.arrays[k].shape[1:]) for k in keys}
+        return out, valid
 
 
 class VLAFlowMatching(nn.Module):
@@ -726,6 +849,7 @@ class VLAFlowMatching(nn.Module):
                     hidden_mult=self.config.vitac_align_hidden_mult,
                 )
 
+        self._init_wam()
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -746,6 +870,247 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    # ------------------------------------------------------------------ world action model
+    # Each modality m ("vision", "tactile") is a stream of per-frame latents with
+    # ``per_frame`` tokens. The suffix holds the observation window (clean,
+    # flow time 0), then the noisy future frames, then the actions:
+    #   [ window: vision | tactile ][ future: vision | tactile ][ action x chunk ]
+    # Shapes below: latents (B, frames, per_frame, D).
+
+    def _init_wam(self):
+        self.wam_specs: dict[str, tuple[int, int]] = {}  # name -> (latent dim, tokens per frame)
+        self.wam_tactile_target = None
+        self.wam_store = None
+        if not self.config.wam_enabled:
+            return
+        cfg = self.config
+        hidden = self.vlm_with_expert.expert_hidden_size
+        if cfg.wam_use_vision:
+            ph, pw = cfg.wam_vision_pool
+            self.wam_specs["vision"] = (
+                self.vlm_with_expert.config.text_config.hidden_size,
+                len(cfg.wam_vision_keys) * ph * pw,
+            )
+        if cfg.wam_use_tactile:
+            backbone = getattr(self.vitac_encoder, "backbone", None)
+            if backbone is None:
+                raise ValueError("wam_use_tactile needs the UniVTAC tactile encoder")
+            if not cfg.vitac_freeze_backbone:
+                # Fine-tuned encoder: the targets come from an EMA copy of it.
+                self.wam_tactile_target = copy.deepcopy(backbone)
+                for p in self.wam_tactile_target.parameters():
+                    p.requires_grad = False
+            self.wam_specs["tactile"] = (cfg.vitac_latent_dims, len(cfg.tactile_keys))
+
+        self.wam_in_proj = nn.ModuleDict({m: nn.Linear(d, hidden) for m, (d, _) in self.wam_specs.items()})
+        self.wam_time_mlp_in = nn.ModuleDict({m: nn.Linear(2 * hidden, hidden) for m in self.wam_specs})
+        self.wam_time_mlp_out = nn.ModuleDict({m: nn.Linear(hidden, hidden) for m in self.wam_specs})
+        self.wam_slot_emb = nn.ParameterDict(
+            {m: nn.Parameter(torch.randn(n, hidden) * 0.02) for m, (_, n) in self.wam_specs.items()}
+        )
+        # Frame offset (window < 0 <= future), continuous so it can later be conditioned on.
+        self.wam_offset_proj = nn.ModuleDict({m: nn.Linear(hidden, hidden) for m in self.wam_specs})
+        for proj in self.wam_offset_proj.values():
+            nn.init.zeros_(proj.weight)
+            nn.init.zeros_(proj.bias)
+        self.wam_out_proj = nn.ModuleDict(
+            {m: nn.Linear(hidden, d) for m, (d, _) in self.wam_specs.items() if self.config.wam_future_offsets(m)}
+        )
+
+    @property
+    def wam_future_names(self) -> list[str]:
+        return [m for m in self.wam_specs if self.config.wam_future_offsets(m)]
+
+    def _wam_num_tokens(self) -> tuple[int, int]:
+        """(window tokens, future tokens) over all modalities."""
+        window = sum(n * self.config.wam_history for _, n in self.wam_specs.values())
+        future = sum(self.wam_specs[m][1] * len(self.config.wam_future_offsets(m)) for m in self.wam_future_names)
+        return window, future
+
+    # ---- latents
+    def _wam_vision_tokens(self, raw):
+        """(B, F, cameras, 64, D) connector tokens -> pooled, normalized (B, F, cameras*ph*pw, D)."""
+        bsize, frames, cams, length, dim = raw.shape
+        side = math.isqrt(length)
+        if side * side != length:
+            raise ValueError(f"expected a square connector token grid, got {length} tokens")
+        grid = raw.float().reshape(-1, length, dim).transpose(1, 2).reshape(-1, dim, side, side)
+        pooled = F.adaptive_avg_pool2d(grid, self.config.wam_vision_pool).flatten(2).transpose(1, 2)
+        pooled = pooled.reshape(bsize, frames, -1, dim)
+        return F.layer_norm(pooled, (dim,))
+
+    @staticmethod
+    def _wam_tactile_tokens(raw):
+        """(B, F, streams, D) backbone features -> normalized tokens."""
+        return F.layer_norm(raw.float(), raw.shape[-1:])
+
+    def _wam_tactile_features(self, backbone, images):
+        """[0, 1] images (N, 3, H, W) -> (N, latent_dims) with the UniVTAC input size."""
+        size = tuple(self.config.vitac_input_size)
+        if images.shape[-2:] != size:
+            images = F.interpolate(images, size=size, mode="bilinear", align_corners=False)
+        return backbone(images)
+
+    def _wam_open_store(self):
+        if self.wam_store is not None:
+            return self.wam_store
+        if not self.config.wam_latent_dir:
+            raise ValueError("training the world action model needs --policy.wam_latent_dir "
+                             "(output of scripts/precompute_wam_latents.py)")
+        keys = list(self.config.wam_vision_keys) if "vision" in self.wam_specs else []
+        if "tactile" in self.wam_specs and self.config.vitac_freeze_backbone:
+            keys += list(self.config.tactile_keys)
+        self.wam_store = _WAMLatentStore(self.config.wam_latent_dir, keys)
+        self.wam_store.check(self.config, tactile="tactile" in self.wam_specs and self.config.vitac_freeze_backbone)
+        return self.wam_store
+
+    def wam_training_latents(self, wam_batch):
+        """Window and future latents of a training batch.
+
+        Returns ``window[m]`` (B, H, P, D), ``future[m]`` (B, K, P, D) and
+        ``future_valid[m]`` (B, K); futures past the episode end are invalid.
+        The window is clamped at the episode start (the first frame repeats).
+        """
+        cfg = self.config
+        device = wam_batch["index"].device
+        index = wam_batch["index"].cpu().numpy().astype(np.int64)
+        hist = cfg.wam_history_offsets
+        window, future, future_valid = {}, {}, {}
+        store = self._wam_open_store()
+
+        if "vision" in self.wam_specs:
+            fut = cfg.wam_future_offsets("vision")
+            raw, valid = store.gather(index, hist + fut, cfg.wam_vision_keys)
+            raw = torch.from_numpy(np.stack([raw[k] for k in cfg.wam_vision_keys], axis=2)).to(device)
+            tokens = self._wam_vision_tokens(raw)  # (B, H+K, P, D)
+            window["vision"], future["vision"] = tokens[:, : len(hist)], tokens[:, len(hist) :]
+            future_valid["vision"] = torch.from_numpy(valid[:, len(hist) :]).to(device)
+
+        if "tactile" in self.wam_specs:
+            fut = cfg.wam_future_offsets("tactile")
+            if cfg.vitac_freeze_backbone:
+                raw, valid = store.gather(index, hist + fut, cfg.tactile_keys)
+                raw = torch.from_numpy(np.stack([raw[k] for k in cfg.tactile_keys], axis=2)).to(device)
+                tokens = self._wam_tactile_tokens(raw)
+                window["tactile"], future["tactile"] = tokens[:, : len(hist)], tokens[:, len(hist) :]
+                future_valid["tactile"] = torch.from_numpy(valid[:, len(hist) :]).to(device)
+            else:
+                # Online: frames (B, offsets, 3, H, W) per stream at the loaded offsets.
+                offsets = wam_batch["tactile_offsets"]
+                hist_idx = [offsets.index(o) for o in hist]
+                fut_idx = [offsets.index(o) for o in fut]
+                win_feats, fut_feats, fut_valid = [], [], []
+                self.wam_tactile_target.eval()
+                for key in cfg.tactile_keys:
+                    frames = wam_batch["tactile_frames"][key]
+                    bsize = frames.shape[0]
+                    win = frames[:, hist_idx].flatten(0, 1)
+                    win_feats.append(self._wam_tactile_features(self.vitac_encoder.backbone, win).view(bsize, len(hist), -1))
+                    if fut_idx:
+                        with torch.no_grad():
+                            tgt = frames[:, fut_idx].flatten(0, 1)
+                            fut_feats.append(
+                                self._wam_tactile_features(self.wam_tactile_target, tgt).view(bsize, len(fut), -1)
+                            )
+                        fut_valid.append(~wam_batch["tactile_is_pad"][key][:, fut_idx].bool())
+                window["tactile"] = self._wam_tactile_tokens(torch.stack(win_feats, dim=2))
+                if fut_idx:
+                    future["tactile"] = self._wam_tactile_tokens(torch.stack(fut_feats, dim=2))
+                    future_valid["tactile"] = torch.stack(fut_valid, dim=0).all(dim=0)
+        return window, future, future_valid
+
+    @torch.no_grad()
+    def wam_current_raw(self, vision_images, tactile_images):
+        """Latents of the current frame for the inference window.
+
+        vision_images: SigLIP-ready (B, 3, H, W) per key in ``wam_vision_keys``.
+        tactile_images: [0, 1] (B, 3, H, W) per key in ``tactile_keys``.
+        Returns name -> raw latent of one frame: vision (B, cameras, 64, D),
+        tactile (B, streams, latent_dims).
+        """
+        raw = {}
+        if "vision" in self.wam_specs:
+            raw["vision"] = torch.stack([self.vlm_with_expert.embed_image(img).float() for img in vision_images], 1)
+        if "tactile" in self.wam_specs:
+            backbone = self.vitac_encoder.backbone  # the same encoder as the prefix, frozen or fine-tuned
+            raw["tactile"] = torch.stack(
+                [self._wam_tactile_features(backbone, img).float() for img in tactile_images], 1
+            )
+        return raw
+
+    def wam_window_from_raw(self, raw_window):
+        """name -> raw (B, H, ...) window -> processed tokens (B, H, P, D)."""
+        out = {}
+        if "vision" in raw_window:
+            out["vision"] = self._wam_vision_tokens(raw_window["vision"])
+        if "tactile" in raw_window:
+            out["tactile"] = self._wam_tactile_tokens(raw_window["tactile"])
+        return out
+
+    @torch.no_grad()
+    def update_wam_ema(self):
+        """EMA of the fine-tuned tactile backbone into the target copy (fine-tuned encoder only)."""
+        if self.wam_tactile_target is None:
+            return
+        decay = self.config.wam_tactile_ema_decay
+        online = self.vitac_encoder.backbone
+        for p_t, p_o in zip(self.wam_tactile_target.parameters(), online.parameters(), strict=True):
+            p_t.lerp_(p_o.detach(), 1.0 - decay)
+        for b_t, b_o in zip(self.wam_tactile_target.buffers(), online.buffers(), strict=True):
+            b_t.copy_(b_o)
+
+    # ---- tokens
+    def _wam_embed(self, name, latents, offsets, time):
+        """latents (B, F, P, D) at frame ``offsets`` with flow time (B,) -> (B, F*P, hidden)."""
+        hidden = self.vlm_with_expert.expert_hidden_size
+        bsize, frames, per_frame, _ = latents.shape
+        x = self.wam_in_proj[name](latents)
+        time_emb = create_sinusoidal_pos_embedding(
+            time, hidden, self.config.min_period, self.config.max_period, device=x.device
+        ).type(x.dtype)
+        emb = torch.cat([x, time_emb[:, None, None, :].expand_as(x)], dim=-1)
+        emb = self.wam_time_mlp_out[name](F.silu(self.wam_time_mlp_in[name](emb)))
+        # Offsets in units of the action chunk, shifted to stay positive.
+        off = torch.tensor([1.0 + o / self.config.chunk_size for o in offsets], dtype=torch.float32, device=x.device)
+        off_emb = create_sinusoidal_pos_embedding(
+            off, hidden, self.config.min_period, self.config.max_period, device=x.device
+        ).type(x.dtype)
+        emb = emb + self.wam_slot_emb[name][None, None] + self.wam_offset_proj[name](off_emb)[None, :, None, :]
+        return emb.reshape(bsize, frames * per_frame, hidden)
+
+    def embed_wam_tokens(self, window, wam_x, wam_time):
+        """Window tokens (clean, time 0) and noisy future tokens, each as one block."""
+        bsize = next(iter(window.values())).shape[0]
+        device = next(iter(window.values())).device
+        zero = torch.zeros(bsize, dtype=torch.float32, device=device)
+        win = [self._wam_embed(m, window[m], self.config.wam_history_offsets, zero) for m in self.wam_specs]
+        fut = [
+            self._wam_embed(m, wam_x[m], self.config.wam_future_offsets(m), wam_time[m])
+            for m in self.wam_future_names
+        ]
+        return torch.cat(win, dim=1), (torch.cat(fut, dim=1) if fut else None)
+
+    def wam_velocities(self, suffix_out):
+        """Velocities of the future tokens per modality, shaped like the latents (B, K, P, D)."""
+        n_window, _ = self._wam_num_tokens()
+        out, start = {}, n_window
+        for name in self.wam_future_names:
+            k, p = len(self.config.wam_future_offsets(name)), self.wam_specs[name][1]
+            v = self.wam_out_proj[name](suffix_out[:, start : start + k * p].to(dtype=torch.float32))
+            out[name] = v.view(v.shape[0], k, p, -1)
+            start += k * p
+        return out
+
+    def _wam_allow_obs_to_actions(self, att_2d_masks, query_offset, key_offset):
+        """Let the future-latent rows also attend to the action key columns."""
+        if not self.wam_specs or not self.config.wam_obs_attend_actions:
+            return att_2d_masks
+        n_window, n_future = self._wam_num_tokens()
+        att_2d_masks = att_2d_masks.clone()
+        rows = slice(query_offset + n_window, query_offset + n_window + n_future)
+        att_2d_masks[:, rows, key_offset + n_window + n_future :] = True
+        return att_2d_masks
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -950,17 +1315,37 @@ class VLAFlowMatching(nn.Module):
         gamma, beta = self.film_head(pooled)  # (B, expert_hidden) each
         return gamma, beta
 
-    def embed_suffix(self, noisy_actions, timestep, film_params=None):
+    def embed_suffix(
+        self, noisy_actions, timestep, film_params=None, wam_window=None, wam_x=None, wam_time=None
+    ):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
 
         When ``film_params`` is provided (``(gamma, beta)`` of shape
         ``(B, expert_hidden)``) the action-time embedding is FiLM-modulated::
 
             out = (1 + gamma)[:, None, :] * x + beta[:, None, :]
+
+        With the world action model the suffix starts with two bidirectional
+        blocks, the clean observation window and the noisy future latents,
+        followed by the action tokens with their original causal mask::
+
+            [ window | future | action_0 ... action_{chunk-1} ]
+
+        The future block sees the window; the actions see both (see
+        ``wam_obs_attend_actions`` for future -> action attention).
         """
         embs = []
         pad_masks = []
         att_masks = []
+
+        if wam_window is not None:
+            window_emb, future_emb = self.embed_wam_tokens(wam_window, wam_x, wam_time)
+            for emb in (window_emb, future_emb):
+                if emb is None:
+                    continue
+                embs.append(emb)
+                pad_masks.append(torch.ones(emb.shape[:2], dtype=torch.bool, device=emb.device))
+                att_masks += [1] + [0] * (emb.shape[1] - 1)
 
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
@@ -992,7 +1377,7 @@ class VLAFlowMatching(nn.Module):
             action_time_emb = (1.0 + gamma[:, None, :]) * action_time_emb + beta[:, None, :]
 
         # Add to input tokens
-        embs.append(action_time_emb)
+        embs.append(action_time_emb.to(dtype=embs[0].dtype) if embs else action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
@@ -1008,9 +1393,13 @@ class VLAFlowMatching(nn.Module):
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
-        tactile_images=None, tactile_masks=None,
+        tactile_images=None, tactile_masks=None, wam_batch=None,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
+
+        With the world action model the return value is ``(losses, wam_losses)``,
+        where ``wam_losses[name] = (per-sample loss (B,), sample valid (B,))``.
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1020,19 +1409,38 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+
+        # Future latents: independent flow time per modality (UWM); with
+        # probability wam_marginal_prob all of them are pure noise for a sample.
+        wam_window = wam_x = wam_time = wam_u = wam_valid = None
+        if self.wam_specs:
+            bsize, device = actions.shape[0], actions.device
+            wam_window, future, wam_valid = self.wam_training_latents(wam_batch)
+            marginal = torch.rand(bsize, device=device) < self.config.wam_marginal_prob
+            wam_x, wam_time, wam_u = {}, {}, {}
+            for name, z in future.items():
+                tau = torch.where(marginal, torch.ones_like(time), self.sample_time(bsize, device))
+                eps = self.sample_noise(z.shape, device)
+                t = tau[:, None, None, None]
+                wam_x[name] = t * eps + (1 - t) * z
+                wam_time[name] = tau
+                wam_u[name] = eps - z
+
         film_params = self._compute_film_params(tactile_images, tactile_masks)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state,
             tactile_images=tactile_images, tactile_masks=tactile_masks,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, time, film_params=film_params
+            x_t, time, film_params=film_params, wam_window=wam_window, wam_x=wam_x, wam_time=wam_time
         )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        prefix_len = prefix_pad_masks.shape[1]
+        att_2d_masks = self._wam_allow_obs_to_actions(att_2d_masks, prefix_len, prefix_len)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
@@ -1042,12 +1450,22 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+        wam_out = suffix_out
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        if not self.wam_specs:
+            return losses
+
+        wam_losses = {}
+        for name, v in self.wam_velocities(wam_out).items():
+            frame_loss = F.mse_loss(wam_u[name], v, reduction="none").mean(dim=(2, 3))  # (B, K)
+            valid = wam_valid[name].to(frame_loss.dtype)
+            count = valid.sum(dim=1)
+            wam_losses[name] = ((frame_loss * valid).sum(dim=1) / count.clamp_min(1), (count > 0).to(frame_loss.dtype))
+        return losses, wam_losses
 
     def sample_actions(
         self,
@@ -1059,9 +1477,13 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         tactile_images=None,
         tactile_masks=None,
+        wam_window=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        ``wam_window``: name -> (B, H, P, D) observation-window latents (world action model).
+        """
         bsize = state.shape[0]
         device = state.device
 
@@ -1088,6 +1510,11 @@ class VLAFlowMatching(nn.Module):
         )
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
+
+        if self.wam_specs:
+            return self._sample_actions_wam(
+                noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window
+            )
 
         x_t = noise
         for step in range(num_steps):
@@ -1126,6 +1553,45 @@ class VLAFlowMatching(nn.Module):
 
         return x_t
 
+    def _sample_actions_wam(
+        self, noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window
+    ):
+        """Euler integration of the actions together with the future latents.
+
+        "joint": all modalities share the time and are denoised together.
+        "marginal": the future latents stay pure noise at time 1 (the
+        condition trained with wam_marginal_prob); only the actions move.
+        The predicted future latents are kept in ``self.last_wam_latents``.
+        """
+        bsize, device = noise.shape[0], noise.device
+        joint = self.config.wam_inference_mode == "joint"
+        wam_x = {
+            name: self.sample_noise(
+                (bsize, len(self.config.wam_future_offsets(name)), self.wam_specs[name][1], self.wam_specs[name][0]),
+                device,
+            )
+            for name in self.wam_future_names
+        }
+        x_t = noise
+        for step in range(num_steps):
+            time = torch.full((bsize,), 1.0 + step * dt, dtype=torch.float32, device=device)
+            wam_time = {name: time if joint else torch.ones_like(time) for name in self.wam_future_names}
+            v_t, wam_v = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time,
+                film_params=film_params,
+                wam_window=wam_window,
+                wam_x=wam_x,
+                wam_time=wam_time,
+            )
+            x_t = x_t + dt * v_t
+            if joint:
+                wam_x = {name: wam_x[name] + dt * wam_v[name] for name in self.wam_future_names}
+        self.last_wam_latents = wam_x if joint else None
+        return x_t
+
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -1133,10 +1599,16 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         film_params=None,
+        wam_window=None,
+        wam_x=None,
+        wam_time=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        With the world action model (``wam_window``) it returns ``(v_actions, {name: v})``.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, timestep, film_params=film_params
+            x_t, timestep, film_params=film_params, wam_window=wam_window, wam_x=wam_x, wam_time=wam_time
         )
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1145,6 +1617,8 @@ class VLAFlowMatching(nn.Module):
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        if wam_window is not None:
+            suffix_att_2d_masks = self._wam_allow_obs_to_actions(suffix_att_2d_masks, 0, 0)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
@@ -1159,7 +1633,10 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1]
+        wam_out = suffix_out
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        return v_t
+        if wam_window is None:
+            return v_t
+        return v_t, self.wam_velocities(wam_out)

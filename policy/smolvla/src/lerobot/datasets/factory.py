@@ -57,7 +57,13 @@ def resolve_delta_timestamps(
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            # A config may load different offsets per key (SmolVLA world action model).
+            indices = (
+                cfg.observation_delta_indices_for(key)
+                if hasattr(cfg, "observation_delta_indices_for")
+                else cfg.observation_delta_indices
+            )
+            delta_timestamps[key] = [i / ds_meta.fps for i in indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
