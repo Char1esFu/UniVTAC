@@ -61,6 +61,19 @@ TASK_NAME=$TASK bash scripts/train.sh --save_freq=3000 --wandb.enable=true \
     2>&1 | tee train_${TASK}.log
 ```
 
+On the NHR cluster, `scripts/train_cluster.sbatch` runs both steps on one A40
+(processing is skipped when the dataset exists) and logs to wandb online
+(`WANDB_MODE`, `WANDB_ENTITY`, `WANDB_PROJECT` override the defaults; the
+script uses `--export=NONE`, so set them with `sbatch --export=NONE,WANDB_MODE=...`):
+
+```bash
+sbatch policy/smolvla/scripts/train_cluster.sbatch put_bottle_in_shelf
+```
+
+Slurm copies the script at submit time, so pull before `sbatch`. The datasets
+arrow cache (`HF_DATASETS_CACHE`) must not be on NFS (`$WORK`): cold reads
+there take about 0.7 s per sample and starve the GPU.
+
 Tasks: `grasp_classify`, `insert_HDMI`, `insert_hole`, `insert_tube`,
 `lift_bottle`, `lift_can`, `pull_out_key`, `put_bottle_in_shelf`.
 
