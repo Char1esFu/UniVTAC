@@ -46,9 +46,12 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=None, help="dataset root (default data/local/<repo>)")
     parser.add_argument("--cameras", nargs="+", default=["observation.images.head", "observation.images.wrist"])
     parser.add_argument(
-        "--tactile", nargs="+",
+        "--tactile", nargs="*",
         default=["observation.images.tactile_ll_marker", "observation.images.tactile_lr_marker"],
+        help="tactile streams; pass --tactile with no value to skip them (fine-tuned tactile "
+             "encoder: its latents are computed online during training)",
     )
+    parser.add_argument("--out", type=Path, default=None, help="output dir (default <root>/wam_latents)")
     parser.add_argument("--vlm", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
     parser.add_argument("--vitac-ckpt", default="encoder/checkpoints/resnet18/20251128-125750/best.pth")
     parser.add_argument("--image-size", type=int, default=512, help="SmolVLA resize_imgs_with_padding")
@@ -59,7 +62,7 @@ def main() -> None:
 
     repo_id = f"local/{args.task_name}-{args.task_config}-{args.expert_data_num}_vitac"
     root = args.root or ROOT / "data" / repo_id
-    out_dir = root / "wam_latents"
+    out_dir = args.out or root / "wam_latents"
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
 
@@ -72,7 +75,7 @@ def main() -> None:
 
     vlm = SmolVLMWithExpertModel(model_id=args.vlm, load_vlm_weights=True, num_vlm_layers=16).to(device)
     vlm.eval()  # its train() override returns None, so no chaining
-    tactile = UniVTACEncoder(pretrained_path=args.vitac_ckpt).backbone.to(device).eval()
+    tactile = UniVTACEncoder(pretrained_path=args.vitac_ckpt).backbone.to(device).eval() if args.tactile else None
 
     outs = {
         k: np.lib.format.open_memmap(out_dir / f"{k}.npy", mode="w+", dtype=np.float16, shape=(n, 64, 960))

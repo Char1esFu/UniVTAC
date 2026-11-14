@@ -1,7 +1,7 @@
 #!/bin/bash -l
 # Process data (if needed) and train SmolVLA + tactile on one NHR alex A40.
 #   sbatch policy/smolvla/scripts/train_cluster.sbatch put_bottle_in_shelf [--steps=... other trainer args]
-# World action model: add WAM=1 to --export (latents are precomputed on first use).
+# World action model: add WAM=1 (and TACTILE_FROZEN=1 to freeze the tactile encoder) to --export.
 # --export=NONE drops the submitting shell's environment, so pass the task as the
 # first argument (or use `sbatch --export=NONE,TASK_NAME=...,WANDB_MODE=...`).
 # The LeRobot dataset and the outputs go to the anvme workspace. Image encoding
@@ -57,18 +57,29 @@ else
         --image-writer-processes 4 --image-writer-threads 4
 fi
 
-# World action model (WAM=1): precompute the frozen latents next to the dataset
-# once (info.json is written last, so it marks a complete run), then enable it.
+# World action model (WAM=1). The vision latents (frozen SigLIP) are always
+# precomputed. TACTILE_FROZEN=1 freezes the tactile encoder, so its latents are
+# precomputed too; otherwise they are computed online by the fine-tuned encoder.
+# Each mode has its own latent dir; info.json is written last and marks a
+# complete run.
 WAM_ARGS=()
 if [ "${WAM:-0}" = 1 ]; then
-    LATENT_DIR=$DATASET_ROOT/wam_latents
+    if [ "${TACTILE_FROZEN:-0}" = 1 ]; then
+        LATENT_DIR=$DATASET_ROOT/wam_latents_frozen
+        TACTILE_LATENTS=()  # script default: both marker streams
+        WAM_ARGS=(--policy.vitac_freeze_backbone=true)
+    else
+        LATENT_DIR=$DATASET_ROOT/wam_latents_unfrozen
+        TACTILE_LATENTS=(--tactile)  # none
+    fi
     if [ -f "$LATENT_DIR/info.json" ]; then
         echo "[train] WAM latents exist: $LATENT_DIR"
     else
         .venv/bin/python scripts/precompute_wam_latents.py "$TASK_NAME" "$TASK_CONFIG" "$EXPERT_DATA_NUM" \
-            --root "$DATASET_ROOT" --num-workers "$NUM_WORKERS"
+            --root "$DATASET_ROOT" --out "$LATENT_DIR" --num-workers "$NUM_WORKERS" \
+            ${TACTILE_LATENTS[@]+"${TACTILE_LATENTS[@]}"}
     fi
-    WAM_ARGS=(--policy.wam_enabled=true --policy.wam_latent_dir="$LATENT_DIR")
+    WAM_ARGS+=(--policy.wam_enabled=true --policy.wam_latent_dir="$LATENT_DIR")
 fi
 
 bash scripts/train.sh --save_freq=10000 --num_workers="$NUM_WORKERS" \
