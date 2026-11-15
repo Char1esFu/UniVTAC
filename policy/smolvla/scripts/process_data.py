@@ -39,6 +39,13 @@ def _sorted_hdf5_files(root: Path) -> list[Path]:
         return sorted(files)
 
 
+def _task_string_from_name(task_name: str) -> str:
+    words = task_name.replace("-", "_").split("_")
+    if len(words) >= 2:
+        return f"{words[0]} the {' '.join(words[1:])}"
+    return task_name.replace("_", " ")
+
+
 class SmolVLADataPreprocessor(BaseDataPreprocessor):
     """BaseDataPreprocessor adapter that exports UniVTAC HDF5 data to LeRobot."""
 
@@ -288,12 +295,16 @@ class SmolVLADataPreprocessor(BaseDataPreprocessor):
         return features
 
     def _sample_instruction(self) -> str:
-        """A "seen" instruction of the benchmark (instructions/<task>.json), the
-        prompt eval_policy.py gives the env with instruction_type: seen."""
-        path = REPO_ROOT / "instructions" / f"{self.task_name}.json"
-        with open(path, "r") as f:
-            instructions = json.load(f)["seen"]
-        return str(np.random.choice(instructions))
+        for path in (
+            POLICY_ROOT / "instructions" / f"{self.task_name}.json",
+            self.raw_root_path.parent / "instructions.json",
+        ):
+            if path.exists():
+                with open(path, "r") as f:
+                    instructions = json.load(f).get("instructions", {"seen": []})["seen"]
+                if instructions:
+                    return str(np.random.choice(instructions))
+        return _task_string_from_name(self.task_name)
 
 
 def _parse_args() -> argparse.Namespace:

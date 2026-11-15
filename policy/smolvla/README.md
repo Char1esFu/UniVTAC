@@ -120,19 +120,6 @@ TRAIN_CONFIG=fp32_scratch EP_NUM=100 \
   the run tag is `TRAIN_CONFIG` plus the execution mode (below), e.g.
   `fp32_scratch-rtc10`.
 
-### Language prompt
-
-`scripts/process_data.py` labels the training data with the benchmark's "seen"
-instruction from `instructions/<task>.json` (e.g. "Rotate the key in the slot
-until mechanical resistance is sensed, then pull the key straight out."). At
-eval, `eval_policy.py` draws the env instruction from the same file
-(`instruction_type: seen` or `unseen` in `deploy.yml`) and the deploy passes
-it to the model (`smolvla_use_env_instruction: true`).
-
-Datasets processed before this change were labelled with a prompt built from
-the task name ("lift the bottle", "pull the out key"); checkpoints trained on
-them need `SMOLVLA_ENV_INSTRUCTION=0`.
-
 ### Action execution (RTC10 by default)
 
 The policy predicts a 50-action chunk; how those chunks are turned into one

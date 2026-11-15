@@ -3,14 +3,7 @@ policy_name: smolvla
 seed: 0
 ckpt_setting: 50
 instruction_type: seen
-# instuction_file is left unset, so eval_policy.py loads instructions/<task>.json
-# and the env draws the prompt from its "seen"/"unseen" list (instruction_type).
-
-# ----- SmolVLA language prompt -----
-# true: the env's instruction (training data from scripts/process_data.py is
-# labelled with the "seen" one). false: the task-name prompt ("pull the out
-# key") of checkpoints processed before that fix. Env var SMOLVLA_ENV_INSTRUCTION=0/1.
-smolvla_use_env_instruction: true
+instuction_file: null
 
 # ----- SmolVLA-specific deploy parameters -----
 # How many actions from each predicted chunk to execute before re-running the

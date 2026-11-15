@@ -126,19 +126,14 @@ def _get_policy_config(model):
 def _instruction_for(instruction: str | None, task_name: str, use_env_instruction: bool = False) -> str:
     """Language prompt for the policy.
 
-    With smolvla_use_env_instruction (default) it is the env's instruction,
-    which eval_policy.py draws from instructions/<task>.json ("seen" or
-    "unseen" per instruction_type); scripts/process_data.py labels the
-    training data with the "seen" one. Otherwise it is the task-name prompt
-    (lift_bottle -> "lift the bottle", pull_out_key -> "pull the out key")
-    that checkpoints processed before that change were trained on.
+    scripts/process_data.py labels every frame with _task_string_from_name
+    (e.g. lift_bottle -> "lift the bottle") unless policy/instructions/ exists,
+    so by default the env's instruction is ignored: eval_policy.py passes
+    "Empty" and parallel_eval_policy.py a sentence from instructions/*.json
+    that the model never saw. Set smolvla_use_env_instruction: true for a
+    checkpoint trained on those instructions.
     """
-    if use_env_instruction:
-        if not instruction or instruction == "Empty":
-            raise ValueError(
-                "smolvla_use_env_instruction needs the env instruction; remove "
-                "instuction_file: null from the deploy yml"
-            )
+    if use_env_instruction and instruction and instruction != "Empty":
         return instruction
     words = task_name.replace("-", "_").split("_")
     if len(words) >= 2:
@@ -166,15 +161,6 @@ def _use_rtc(args: dict) -> bool:
     if env is not None:
         return env.strip().lower() in ("1", "true", "yes")
     return bool(args.get("smolvla_rtc", False))
-
-
-def _use_env_instruction(args: dict) -> bool:
-    """Prompt from the env (instructions/<task>.json) instead of the task name.
-    SMOLVLA_ENV_INSTRUCTION=1/0 overrides smolvla_use_env_instruction."""
-    env = os.environ.get("SMOLVLA_ENV_INSTRUCTION")
-    if env is not None:
-        return env.strip().lower() in ("1", "true", "yes")
-    return bool(args.get("smolvla_use_env_instruction", True))
 
 
 def get_run_tag(args: dict) -> str:
@@ -232,7 +218,7 @@ class _SmolVLALocalPolicy(BasePolicy):
 
         # ------------------------------------------------------------------ env
         self.task_name = args["task_name"]
-        self.use_env_instruction = _use_env_instruction(args)
+        self.use_env_instruction = bool(args.get("smolvla_use_env_instruction", False))
 
         ckpt_dir = _resolve_ckpt_dir(args)
         if not ckpt_dir.exists():
@@ -805,7 +791,7 @@ class Policy(BasePolicy):
 
     def __init__(self, args: dict):
         self.task_name = args["task_name"]
-        self.use_env_instruction = _use_env_instruction(args)
+        self.use_env_instruction = bool(args.get("smolvla_use_env_instruction", False))
         self.model = _SmolVLAFastAPIClient(args)
         self._instruction_set = False
         self._cached_instruction: str | None = None
