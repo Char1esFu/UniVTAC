@@ -1,0 +1,817 @@
+From 37d2af15a41300773e68a5cd7a0cb958666231fd Mon Sep 17 00:00:00 2001
+From: univtac <univtac@localhost>
+Date: Sun, 15 Nov 2026 03:34:37 +0100
+Subject: [PATCH 2/2] cosmos3: tactile modality in the generation pathway
+ (UniVTAC encoder, per-key image offsets)
+
+---
+ src/lerobot/datasets/factory.py               |   4 +-
+ .../policies/cosmos3/configuration_cosmos3.py |  62 ++++
+ .../policies/cosmos3/modeling_cosmos3.py      | 298 ++++++++++++++++--
+ .../policies/cosmos3/tactile_cosmos3.py       |  74 +++++
+ 4 files changed, 413 insertions(+), 25 deletions(-)
+ create mode 100644 src/lerobot/policies/cosmos3/tactile_cosmos3.py
+
+diff --git a/src/lerobot/datasets/factory.py b/src/lerobot/datasets/factory.py
+index 5d08183a..08ab5fdd 100644
+--- a/src/lerobot/datasets/factory.py
++++ b/src/lerobot/datasets/factory.py
+@@ -81,7 +81,9 @@ def resolve_delta_timestamps(
+         # conventions; matching `OBS_IMAGES` alone would silently give singular-key
+         # datasets no image history at all.
+         if policy_key.startswith(OBS_IMAGE):
+-            indices = image_indices
++            # Policies can give every image key its own offsets (UniVTAC extension, Cosmos3 tactile streams).
++            per_key = getattr(cfg, "image_delta_indices_for_key", None)
++            indices = per_key(policy_key) if callable(per_key) else image_indices
+             matched_image_keys.append(key)
+         elif policy_key == OBS_STATE:
+             indices = state_indices
+diff --git a/src/lerobot/policies/cosmos3/configuration_cosmos3.py b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+index ba00e4ac..6b449eaa 100644
+--- a/src/lerobot/policies/cosmos3/configuration_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+@@ -342,6 +342,32 @@ class Cosmos3Config(PreTrainedConfig):
+     # video_latent_frames = chunk_size / (4 * video_stride).
+     video_stride: int = 1
+     video_latent_frames: int | None = None
++    # Tactile modality of the generation pathway (UniVTAC extension). Every stream of `tactile_keys` (images
++    # that are not cameras of the canvas) is encoded by the UniVTAC ResNet into one token per frame. The current
++    # frame is a clean condition; `tactile_future_steps` future frames, `tactile_future_stride` dataset frames
++    # apart (horizon stride * steps), are denoised together with the video and the actions. Tokens per sample:
++    # streams * (1 + steps). The tokens sit on the M-RoPE time axis at their frame times, so the tactile stride
++    # and horizon are independent of the video ones. 0 steps keeps the tactile modality as a condition only.
++    # `tactile_future_offsets` replaces stride and steps by explicit dataset frame offsets (e.g. denser near t).
++    tactile_keys: list[str] = field(default_factory=list)
++    tactile_history_offsets: list[int] = field(default_factory=lambda: [0])
++    tactile_future_stride: int = 5
++    tactile_future_steps: int = 6
++    tactile_future_offsets: list[int] | None = None
++    tactile_encoder_path: str | None = None  # UniVTAC checkpoint (best.pth)
++    tactile_backbone: str = "resnet18"
++    tactile_latent_dim: int = 512
++    tactile_input_size: tuple[int, int] = (224, 224)
++    # False: the encoder is frozen and gives the conditions and the targets. True: the encoder trains through
++    # the condition tokens and the targets come from an EMA copy (a target encoder trained by its own
++    # prediction loss could collapse), updated after every optimizer step with `tactile_ema_decay`.
++    tactile_encoder_trainable: bool = False
++    tactile_ema_decay: float = 0.999
++    tactile_loss_weight: float = 10.0
++    # Draw the tactile noise level separately, otherwise the tactile tokens share the noise level of the video.
++    independent_tactile_schedule: bool = False
++    tactile_time_distribution: TimeDistribution = "logitnormal"
++    tactile_training_shift: float = 1.0
+     # Actions are zero padded to this width, the width of the action projections.
+     max_action_dim: int = 64
+     # Storage dtype of the parameters, except the modules kept in float32.
+@@ -507,6 +533,16 @@ class Cosmos3Config(PreTrainedConfig):
+                 )
+         elif self.video_latent_frames < 1:
+             raise ValueError(f"video_latent_frames={self.video_latent_frames} must be >= 1.")
++        if self.tactile_keys:
++            if list(self.tactile_history_offsets) != [0]:
++                raise NotImplementedError(
++                    "tactile_history_offsets other than [0] need a frame buffer at inference (not implemented)."
++                )
++            if self.tactile_future_stride < 1 or self.tactile_future_steps < 0:
++                raise ValueError("tactile_future_stride must be >= 1 and tactile_future_steps >= 0.")
++            offsets = self.tactile_future_frames
++            if any(offset < 1 for offset in offsets) or len(set(offsets)) != len(offsets):
++                raise ValueError(f"tactile future offsets must be distinct and > 0, got {offsets}.")
+         if not 0.0 <= self.cfg_dropout_rate <= 1.0:
+             raise ValueError(f"cfg_dropout_rate={self.cfg_dropout_rate} is outside [0, 1].")
+ 
+@@ -535,6 +571,9 @@ class Cosmos3Config(PreTrainedConfig):
+             if channels != 3:
+                 raise ValueError(f"The first camera {image_features[0]} is not [3, H, W].")
+             self.view_size = (height, width)
++        overlap = set(self.tactile_keys) & set(self.image_features)
++        if overlap:
++            raise ValueError(f"{sorted(overlap)} are tactile_keys and cameras of the canvas, pick one.")
+         state = self.robot_state_feature
+         action_shape = self.output_features[ACTION].shape
+         if self.use_state and (state is None or state.shape != action_shape):
+@@ -577,6 +616,29 @@ class Cosmos3Config(PreTrainedConfig):
+         num_frames = (self.vae.scale_factor_temporal or 1) * self.num_video_latent_frames + 1
+         return [self.video_stride * i for i in range(num_frames)]
+ 
++    @property
++    def tactile_future_frames(self) -> list[int]:
++        """Dataset frame offsets of the predicted tactile frames: stride, 2*stride, ..., or the explicit offsets."""
++        if self.tactile_future_offsets is not None:
++            return sorted(self.tactile_future_offsets)
++        return [self.tactile_future_stride * (i + 1) for i in range(self.tactile_future_steps)]
++
++    @property
++    def tactile_frame_offsets(self) -> list[int]:
++        """Dataset frame offsets of the tactile streams, the current frame first, then the future frames."""
++        return sorted(set(self.tactile_history_offsets) | set(self.tactile_future_frames))
++
++    def image_delta_indices_for_key(self, key: str) -> list[int] | None:
++        """
++        Frame offsets of one image key of the dataset: the clip for the cameras of the canvas, the tactile offsets
++        for `tactile_keys`, None (current frame only) for the image keys the policy does not use.
++        """
++        if key in self.tactile_keys:
++            return self.tactile_frame_offsets
++        if self.input_features and key in self.input_features:
++            return self.video_frame_offsets
++        return None
++
+     @property
+     def image_observation_delta_indices(self) -> list[int]:
+         """The video clip of a training sample: the condition frame and the future frames (video_frame_offsets)."""
+diff --git a/src/lerobot/policies/cosmos3/modeling_cosmos3.py b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+index 49431cb6..d34a4276 100644
+--- a/src/lerobot/policies/cosmos3/modeling_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+@@ -18,6 +18,7 @@ Cosmos3 jointly predicts future video frames and robot action chunks from robot
+ observations and a language instruction.
+ """
+ 
++import copy
+ import itertools
+ import logging
+ import math
+@@ -41,6 +42,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
+ from lerobot.utils.device_utils import resolve_safetensors_device
+ from lerobot.utils.import_utils import _diffusers_available, _transformers_available, require_package
+ 
++from .tactile_cosmos3 import UniVTACTactileEncoder
+ from .configuration_cosmos3 import (
+     RESOLUTION_TIER_LIMITS,
+     Cosmos3Config,
+@@ -169,7 +171,7 @@ class Cosmos3Policy(PreTrainedPolicy):
+         (`Cosmos3VFMNetwork._action_modules`) at `optimizer_action_lr_multiplier` times the learning rate, the
+         others at the learning rate.
+         """
+-        action_modules = self.model.network._action_modules
++        action_modules = self.model.network._action_modules + self.model.network._tactile_head_modules
+         action_params: list[nn.Parameter] = []
+         other_params: list[nn.Parameter] = []
+         for name, param in self.named_parameters():
+@@ -186,7 +188,7 @@ class Cosmos3Policy(PreTrainedPolicy):
+         """LoRA on the attention projections of the generation pathway, the action modules train in full."""
+         return {
+             "target_modules": ["q_proj_gen", "k_proj_gen", "v_proj_gen", "o_proj_gen"],
+-            "modules_to_save": list(Cosmos3VFMNetwork._action_modules),
++            "modules_to_save": list(Cosmos3VFMNetwork._action_modules + Cosmos3VFMNetwork._tactile_modules),
+         }
+ 
+     @classmethod
+@@ -198,29 +200,36 @@ class Cosmos3Policy(PreTrainedPolicy):
+         native `keys_to_skip_loading`), then `load_action_modules` turns back to true so the checkpoints of
+         the run load them.
+         """
+-        if model.config.load_action_modules:
++        network = model.model.network
++
++        def in_modules(key: str, modules: list[str]) -> bool:
++            return any(part in modules for part in key.split("."))
++
++        if model.config.load_action_modules and not network._tactile_modules_present:
+             return super()._load_checkpoint(model, checkpoint, map_location, strict)
+-        action_modules = model.model.network._action_modules
++        skipped = [] if model.config.load_action_modules else list(network._action_modules)
+         state_dict = {
+             key: value
+             for key, value in checkpoint.load_state_dict(
+                 device=resolve_safetensors_device(map_location)
+             ).items()
+-            if not any(part in action_modules for part in key.split("."))
++            if not in_modules(key, skipped)
+         }
++        # A base checkpoint has no tactile modules: they keep their initialization (the UniVTAC encoder weights).
++        has_tactile = any(in_modules(key, network._tactile_modules) for key in state_dict)
++        optional = skipped + ([] if has_tactile else list(network._tactile_modules))
+         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+-        missing_keys = [
+-            key for key in missing_keys if not any(part in action_modules for part in key.split("."))
+-        ]
++        missing_keys = [key for key in missing_keys if not in_modules(key, optional)]
+         if strict and (missing_keys or unexpected_keys):
+             raise RuntimeError(
+                 f"Missing keys {missing_keys}, unexpected keys {unexpected_keys} in {checkpoint.files}."
+             )
+         log_model_loading_keys(missing_keys, unexpected_keys)
+-        model.config.load_action_modules = True
+-        logging.info(
+-            f"Kept the initialization of the action modules {action_modules} when loading {checkpoint.files}."
+-        )
++        if skipped:
++            model.config.load_action_modules = True
++            logging.info(f"Kept the initialization of the action modules {skipped} when loading {checkpoint.files}.")
++        if network._tactile_modules_present and not has_tactile:
++            logging.info(f"Kept the initialization of the tactile modules when loading {checkpoint.files}.")
+         return model
+ 
+     def reset(self):
+@@ -242,12 +251,39 @@ class Cosmos3Policy(PreTrainedPolicy):
+         """Samples whose clip and action chunk lie inside their episode `[batch]`, from the `*_is_pad` flags."""
+         in_episode = torch.ones(batch[ACTION].shape[0], dtype=torch.bool, device=batch[ACTION].device)
+         for key, value in batch.items():
+-            if key.endswith("_is_pad"):
++            # Tactile frames past the episode end only leave their own tokens out of the loss.
++            if key.endswith("_is_pad") and key.removesuffix("_is_pad") not in self.config.tactile_keys:
+                 in_episode &= ~value.any(dim=-1)
+         return in_episode
+ 
++    def prepare_tactile(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
++        """
++        The tactile images `[batch, frames, streams, 3, H, W]` in [0, 1] (the frames of `tactile_frame_offsets` in
++        training, the current frame at inference) and the validity of the future frames `[batch, future]`
++        (False past the episode end), None without tactile streams.
++        """
++        if not self.config.tactile_keys:
++            return None, None
++        frames = []
++        for key in self.config.tactile_keys:
++            images = batch[key]
++            frames.append(images[:, None] if images.ndim == 4 else images)
++        images = torch.stack(frames, dim=2)
++        valid = torch.ones(images.shape[0], images.shape[1] - 1, dtype=torch.bool, device=images.device)
++        for key in self.config.tactile_keys:
++            pad = batch.get(f"{key}_is_pad")
++            if pad is not None and pad.ndim == 2 and pad.shape[1] == images.shape[1]:
++                valid &= ~pad[:, 1:]
++        return images, valid
++
++    def update(self):
++        """After every optimizer step: the EMA of the tactile target encoder."""
++        if self.config.tactile_keys and self.config.tactile_encoder_trainable:
++            self.model.network.update_tactile_target(self.config.tactile_ema_decay)
++
+     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
+-        """Run the batch through the model and compute the joint video and action loss for training."""
++        """Run the batch through the model and compute the joint video, action and tactile loss for training."""
++        tactile_images, tactile_future_valid = self.prepare_tactile(batch)
+         loss, losses = self.model(
+             input_ids=batch["input_ids"],
+             pixel_values_videos_gen=batch["pixel_values_videos_gen"],
+@@ -262,6 +298,8 @@ class Cosmos3Policy(PreTrainedPolicy):
+             image_grid_thw=batch.get("image_grid_thw"),
+             video_grid_thw=batch.get("video_grid_thw"),
+             loss_mask=self.prepare_loss_mask(batch),
++            tactile_images=tactile_images,
++            tactile_future_valid=tactile_future_valid,
+         )
+         return loss, {name: value.item() for name, value in losses.items()}
+ 
+@@ -287,6 +325,7 @@ class Cosmos3Policy(PreTrainedPolicy):
+             negative_input_ids=batch.get("negative_input_ids"),
+             negative_attention_mask=batch.get("negative_attention_mask"),
+             negative_mm_token_type_ids=batch.get("negative_mm_token_type_ids"),
++            tactile_images=self.prepare_tactile(batch)[0],
+         )
+         if self.config.save_predicted_video:
+             self.last_predicted_latents = video_latents.cpu()
+@@ -367,6 +406,8 @@ class FlowState:
+ 
+     video_latents: Tensor
+     actions: Tensor
++    # Normalized tactile latents `[batch, frames, streams, tactile_latent_dim]`, None without tactile streams.
++    tactile: Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -385,6 +426,10 @@ class SequencePlan:
+     video_condition_mask: Tensor
+     action_condition_mask: Tensor
+     action_start_frame_offset: Tensor
++    # `[batch, tactile_frames]`, True on the current (clean) frame, and the dataset frame offset of every
++    # tactile token `[tactile_frames * streams]`. None without tactile streams.
++    tactile_condition_mask: Tensor | None = None
++    tactile_token_offsets: Tensor | None = None
+ 
+ 
+ # (x_t, timestep) -> v_t, the timestep a scalar tensor in [0, num_train_timesteps].
+@@ -433,6 +478,8 @@ class OmniMoTModel(nn.Module):
+         video_sigmas: Tensor | None = None,
+         action_sigmas: Tensor | None = None,
+         loss_mask: Tensor | None = None,
++        tactile_images: Tensor | None = None,
++        tactile_future_valid: Tensor | None = None,
+     ) -> tuple[Tensor, dict[str, Tensor]]:
+         """
+         Flow matching loss of a training batch.
+@@ -466,14 +513,24 @@ class OmniMoTModel(nn.Module):
+         batch_size, num_actions = packed_actions.shape[:2]
+         plan = self.build_sequence_plan(video_grid_thw_gen, num_actions)
+         clean = self.encode_clean(pixel_values_videos_gen, video_grid_thw_gen, packed_actions, plan)
++        clean.tactile = self.encode_tactile(tactile_images, plan, training=True)
+         if noise is None:
+-            noise = FlowState(torch.randn_like(clean.video_latents), torch.randn_like(clean.actions))
++            noise = FlowState(
++                torch.randn_like(clean.video_latents),
++                torch.randn_like(clean.actions),
++                None if clean.tactile is None else torch.randn_like(clean.tactile),
++            )
+         if video_sigmas is None or action_sigmas is None:
+             height, width = pixel_values_videos_gen.shape[-2:]
+             video_sigmas, action_sigmas = self.sample_training_sigmas(
+                 batch_size, height, width, actions.device
+             )
+-        noisy = self.add_noise(clean, noise, video_sigmas, action_sigmas, plan)
++        tactile_sigmas = video_sigmas
++        if clean.tactile is not None and self.config.independent_tactile_schedule:
++            tactile_sigmas = self.sample_train_time(
++                self.config.tactile_time_distribution, batch_size, self.config.tactile_training_shift
++            ).to(video_sigmas.device)
++        noisy = self.add_noise(clean, noise, video_sigmas, action_sigmas, plan, tactile_sigmas)
+ 
+         position_ids = self.network.get_rope_index(
+             input_ids,
+@@ -485,6 +542,7 @@ class OmniMoTModel(nn.Module):
+             mm_token_type_ids=mm_token_type_ids,
+             image_grid_thw=image_grid_thw,
+             video_grid_thw=video_grid_thw,
++            tactile_token_offsets=plan.tactile_token_offsets,
+         )
+         velocity = self.predict_velocity(
+             noisy,
+@@ -498,11 +556,62 @@ class OmniMoTModel(nn.Module):
+             pixel_values_videos=pixel_values_videos,
+             image_grid_thw=image_grid_thw,
+             video_grid_thw=video_grid_thw,
++            tactile_timesteps=tactile_sigmas * self.config.num_train_timesteps,
+         )
+         target = FlowState(noise.video_latents - clean.video_latents, noise.actions - clean.actions)
+         video_loss, action_loss = self.flow_matching_loss(velocity, target, plan, loss_mask)
+         loss = self.config.video_loss_weight * video_loss + self.config.action_loss_weight * action_loss
+-        return loss, {"video_loss": video_loss.detach(), "action_loss": action_loss.detach()}
++        losses = {"video_loss": video_loss.detach(), "action_loss": action_loss.detach()}
++        if clean.tactile is not None and self.config.tactile_future_frames:
++            tactile_loss = self.tactile_loss(
++                velocity.tactile, noise.tactile - clean.tactile, plan, tactile_future_valid, loss_mask
++            )
++            loss = loss + self.config.tactile_loss_weight * tactile_loss
++            losses["tactile_loss"] = tactile_loss.detach()
++        return loss, losses
++
++    def encode_tactile(self, tactile_images: Tensor | None, plan: SequencePlan, training: bool) -> Tensor | None:
++        """
++        The normalized tactile latents `[batch, frames, streams, tactile_latent_dim]` of the sequence plan: the
++        current frame from the encoder, the future frames from the target encoder in training and zero for
++        sampling (only the current frame is given).
++        """
++        if plan.tactile_condition_mask is None:
++            return None
++        if tactile_images is None:
++            raise ValueError(f"The batch has no tactile images for tactile_keys={self.config.tactile_keys}.")
++        num_frames = plan.tactile_condition_mask.shape[1]
++        current = self.network.encode_tactile(tactile_images[:, :1], target=False)  # [B,1,S,L]
++        if training:
++            if tactile_images.shape[1] != num_frames:
++                raise ValueError(f"Expected {num_frames} tactile frames, got {tactile_images.shape[1]}.")
++            future = self.network.encode_tactile(tactile_images[:, 1:], target=True)
++        else:
++            future = current.new_zeros(current.shape[0], num_frames - 1, *current.shape[2:])
++        return torch.cat([current, future], dim=1)
++
++    def tactile_loss(
++        self,
++        velocity: Tensor,
++        target: Tensor,
++        plan: SequencePlan,
++        future_valid: Tensor | None,
++        loss_mask: Tensor | None,
++    ) -> Tensor:
++        """
++        Mean squared velocity error over the noisy tactile tokens inside the episode and the latent channels,
++        per sample, averaged over the samples of `loss_mask`.
++        """
++        noisy = ~plan.tactile_condition_mask  # [B,T]
++        if future_valid is not None:
++            noisy = noisy.clone()
++            noisy[:, 1:] &= future_valid
++        error = ((velocity - target) ** 2).mean(dim=-1)  # [B,T,S]
++        weights = noisy[:, :, None].float().expand_as(error)
++        per_sample = (error * weights).sum(dim=(1, 2)) / weights.sum(dim=(1, 2)).clamp(min=1)
++        if loss_mask is None:
++            loss_mask = torch.ones_like(per_sample, dtype=torch.bool)
++        return per_sample.where(loss_mask, 0.0).sum() / loss_mask.sum().clamp(min=1)
+ 
+     @torch.no_grad()
+     def generate(
+@@ -523,6 +632,7 @@ class OmniMoTModel(nn.Module):
+         negative_mm_token_type_ids: Tensor | None = None,
+         noise: FlowState | None = None,
+         generator: torch.Generator | None = None,
++        tactile_images: Tensor | None = None,
+     ) -> tuple[Tensor, Tensor]:
+         """
+         Sample the actions and the video latents with the sampling settings of the config. The arguments shared
+@@ -571,6 +681,7 @@ class OmniMoTModel(nn.Module):
+             mm_token_type_ids=mm_token_type_ids,
+             image_grid_thw=image_grid_thw,
+             video_grid_thw=video_grid_thw,
++            tactile_token_offsets=plan.tactile_token_offsets,
+         )
+         guidance_scale = self.config.guidance_scale
+         # Timesteps strictly inside (low, high) get the guidance, all of them when guidance_interval is None.
+@@ -587,13 +698,18 @@ class OmniMoTModel(nn.Module):
+                 action_start_frame_offset=plan.action_start_frame_offset,
+                 attention_mask=negative_attention_mask,
+                 mm_token_type_ids=negative_mm_token_type_ids,
++                tactile_token_offsets=plan.tactile_token_offsets,
+             )
+ 
+         clean = self.encode_clean(pixel_values_videos_gen, video_grid_thw_gen, packed_actions, plan)
++        clean.tactile = self.encode_tactile(tactile_images, plan, training=False)
+         if noise is None:
+             video_noise = torch.randn(clean.video_latents.shape, generator=generator, device=device)
+             action_noise = torch.randn(clean.actions.shape, generator=generator, device=device)
+-            noise = FlowState(video_noise, action_noise)
++            tactile_noise = None
++            if clean.tactile is not None:
++                tactile_noise = torch.randn(clean.tactile.shape, generator=generator, device=device)
++            noise = FlowState(video_noise, action_noise, tactile_noise)
+         # Noise level 1 outside the conditions, the conditions keep their clean values.
+         ones = clean.actions.new_ones(batch_size)
+         noisy = self.add_noise(clean, noise, ones, ones, plan)
+@@ -632,9 +748,15 @@ class OmniMoTModel(nn.Module):
+             v_cond_action, v_uncond_action = velocity.actions, uncond_velocity.actions
+             video_velocity = v_uncond_video + guidance_scale * (v_cond_video - v_uncond_video)
+             action_velocity = v_uncond_action + guidance_scale * (v_cond_action - v_uncond_action)
+-            return self.mask_velocity(FlowState(video_velocity, action_velocity), plan)
++            tactile_velocity = None
++            if velocity.tactile is not None:
++                v_cond_tactile, v_uncond_tactile = velocity.tactile, uncond_velocity.tactile
++                tactile_velocity = v_uncond_tactile + guidance_scale * (v_cond_tactile - v_uncond_tactile)
++            return self.mask_velocity(FlowState(video_velocity, action_velocity, tactile_velocity), plan)
+ 
+         sampled = self.sample(velocity_fn, noisy)
++        # The sampled tactile latents of the last chunk (current frame first), for analysis.
++        self.last_predicted_tactile = sampled.tactile
+         return self.unpack_actions(sampled.actions), sampled.video_latents
+ 
+     def pack_actions(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
+@@ -705,10 +827,19 @@ class OmniMoTModel(nn.Module):
+         device = video_grid_thw_gen.device
+         video_condition_mask = torch.arange(num_latent_frames, device=device) < num_condition_frames
+         action_condition_mask = torch.arange(num_actions, device=device) < num_condition_actions
++        tactile_condition_mask = tactile_token_offsets = None
++        if self.config.tactile_keys:
++            offsets = self.config.tactile_frame_offsets  # the current frame first
++            tactile_condition_mask = (torch.arange(len(offsets), device=device) < 1).expand(batch_size, -1)
++            tactile_token_offsets = torch.tensor(offsets, device=device, dtype=torch.float32).repeat_interleave(
++                len(self.config.tactile_keys)
++            )
+         return SequencePlan(
+             video_condition_mask.expand(batch_size, -1),
+             action_condition_mask.expand(batch_size, -1),
+             torch.full((batch_size,), action_start_frame_offset, device=device),
++            tactile_condition_mask,
++            tactile_token_offsets,
+         )
+ 
+     def encode_clean(
+@@ -788,19 +919,25 @@ class OmniMoTModel(nn.Module):
+         video_sigmas: Tensor,
+         action_sigmas: Tensor,
+         plan: SequencePlan,
++        tactile_sigmas: Tensor | None = None,
+     ) -> FlowState:
+         """
+         `x_t = sigma * noise + (1 - sigma) * x_0` with the noise level of every sample `[batch]`, the native
+         rectified flow interpolation. The condition frames and actions keep `x_0` (noise level 0), and the padded
+         action channels after `original_action_dim` stay zero.
+         """
++        tactile = None
++        if clean.tactile is not None:
++            sigmas = video_sigmas if tactile_sigmas is None else tactile_sigmas
++            sigmas = (sigmas[:, None] * ~plan.tactile_condition_mask)[:, :, None, None]  # [B,T_tac,1,1]
++            tactile = noise.tactile * sigmas + clean.tactile * (1 - sigmas)
+         video_sigmas = video_sigmas[:, None] * ~plan.video_condition_mask  # [B,T]
+         video_sigmas = video_sigmas[:, None, :, None, None]  # [B,1,T,1,1]
+         video_latents = noise.video_latents * video_sigmas + clean.video_latents * (1 - video_sigmas)
+         action_sigmas = (action_sigmas[:, None] * ~plan.action_condition_mask)[:, :, None]  # [B,T_act,1]
+         actions = noise.actions * action_sigmas + clean.actions * (1 - action_sigmas)
+         actions[..., self.config.original_action_dim :] = 0.0
+-        return FlowState(video_latents, actions)
++        return FlowState(video_latents, actions, tactile)
+ 
+     def flow_matching_loss(
+         self, velocity: FlowState, target: FlowState, plan: SequencePlan, loss_mask: Tensor | None = None
+@@ -839,6 +976,7 @@ class OmniMoTModel(nn.Module):
+         pixel_values_videos: Tensor | None = None,
+         image_grid_thw: Tensor | None = None,
+         video_grid_thw: Tensor | None = None,
++        tactile_timesteps: Tensor | None = None,
+     ) -> FlowState:
+         """
+         One network call: the float32 velocity at `x_t` conditioned on one prompt, the conditional prompt with
+@@ -869,10 +1007,26 @@ class OmniMoTModel(nn.Module):
+             actions=x_t.actions,
+             action_timesteps=action_timesteps[:, None].expand(-1, num_actions),
+             action_condition_mask=plan.action_condition_mask,
++            **self.tactile_network_inputs(x_t, video_timesteps, tactile_timesteps, plan),
+         )
+         if output.video_velocity is None or output.action_velocity is None:
+             raise ValueError("The network output has no action velocity.")
+-        return FlowState(output.video_velocity.float(), output.action_velocity.float())
++        tactile_velocity = None if output.tactile_velocity is None else output.tactile_velocity.float()
++        return FlowState(output.video_velocity.float(), output.action_velocity.float(), tactile_velocity)
++
++    @staticmethod
++    def tactile_network_inputs(
++        x_t: FlowState, video_timesteps: Tensor, tactile_timesteps: Tensor | None, plan: SequencePlan
++    ) -> dict[str, Tensor]:
++        """The tactile arguments of the network call, none without tactile streams."""
++        if x_t.tactile is None:
++            return {}
++        timesteps = video_timesteps if tactile_timesteps is None else tactile_timesteps
++        return {
++            "tactile": x_t.tactile,
++            "tactile_timesteps": timesteps[:, None].expand(-1, x_t.tactile.shape[1]),
++            "tactile_condition_mask": plan.tactile_condition_mask,
++        }
+ 
+     def mask_velocity(self, velocity: FlowState, plan: SequencePlan) -> FlowState:
+         """Zero the velocity on the condition frames and actions and on the padded action channels."""
+@@ -881,7 +1035,10 @@ class OmniMoTModel(nn.Module):
+         )
+         actions = velocity.actions.masked_fill(plan.action_condition_mask[:, :, None], 0.0)
+         actions[..., self.config.original_action_dim :] = 0.0
+-        return FlowState(video_latents, actions)
++        tactile = None
++        if velocity.tactile is not None:
++            tactile = velocity.tactile.masked_fill(plan.tactile_condition_mask[:, :, None, None], 0.0)
++        return FlowState(video_latents, actions, tactile)
+ 
+     def sample(self, velocity_fn: VelocityFn, x_t: FlowState) -> FlowState:
+         """
+@@ -892,11 +1049,15 @@ class OmniMoTModel(nn.Module):
+         device = x_t.video_latents.device
+         video_scheduler = self.make_scheduler(device)
+         action_scheduler = self.make_scheduler(device)
++        tactile_scheduler = self.make_scheduler(device) if x_t.tactile is not None else None
+         for timestep in video_scheduler.timesteps:
+             velocity = velocity_fn(x_t, timestep)
+             x_t = FlowState(
+                 video_scheduler.step(velocity.video_latents, timestep, x_t.video_latents).prev_sample,
+                 action_scheduler.step(velocity.actions, timestep, x_t.actions).prev_sample,
++                None
++                if tactile_scheduler is None
++                else tactile_scheduler.step(velocity.tactile, timestep, x_t.tactile).prev_sample,
+             )
+         return x_t
+ 
+@@ -936,6 +1097,7 @@ class Cosmos3VFMNetworkOutput(ModelOutput):
+ 
+     video_velocity: Tensor | None = None
+     action_velocity: Tensor | None = None
++    tactile_velocity: Tensor | None = None
+     last_hidden_state: Tensor | None = None
+     last_hidden_state_gen: Tensor | None = None
+ 
+@@ -959,6 +1121,10 @@ class Cosmos3VFMNetwork(nn.Module):
+     # Action modules: trained at `optimizer_action_lr_multiplier` times the learning rate, not loaded with
+     # `load_action_modules` false.
+     _action_modules = ["action2llm", "llm2action", "action_modality_embed"]
++    # Tactile modality (UniVTAC extension): the head modules train at the action learning rate multiplier, the
++    # encoders at the learning rate. Missing from a base checkpoint, they keep their initialization.
++    _tactile_head_modules = ["tactile2llm", "llm2tactile", "tactile_modality_embed", "tactile_stream_embed"]
++    _tactile_modules = _tactile_head_modules + ["tactile_encoder", "tactile_target_encoder"]
+     # Generation pathway modules of the backbone (the native "moe_gen" modules and `k_norm_und_for_gen` of
+     # Cosmos3 Edge), the only backbone modules that train with `train_gen_stream_only`.
+     _gen_stream_modules = [
+@@ -993,6 +1159,18 @@ class Cosmos3VFMNetwork(nn.Module):
+         self.action2llm = DomainAwareLinear(config.max_action_dim, hidden_size, config.num_embodiment_domains)
+         self.llm2action = DomainAwareLinear(hidden_size, config.max_action_dim, config.num_embodiment_domains)
+         self.action_modality_embed = ModalityEmbedding(hidden_size)
++        self._tactile_modules_present = bool(config.tactile_keys)
++        if config.tactile_keys:
++            latent_dim = config.tactile_latent_dim
++            self.tactile_encoder = UniVTACTactileEncoder(
++                config.tactile_backbone, latent_dim, config.tactile_input_size, config.tactile_encoder_path
++            )
++            if config.tactile_encoder_trainable:
++                self.tactile_target_encoder = copy.deepcopy(self.tactile_encoder)
++            self.tactile2llm = nn.Linear(latent_dim, hidden_size)
++            self.llm2tactile = nn.Linear(hidden_size, latent_dim)
++            self.tactile_modality_embed = ModalityEmbedding(hidden_size)
++            self.tactile_stream_embed = nn.Parameter(torch.zeros(len(config.tactile_keys), hidden_size))
+ 
+         self._init_weights()
+         self._set_requires_grad()
+@@ -1011,10 +1189,22 @@ class Cosmos3VFMNetwork(nn.Module):
+         self.llm2action._init_weights(self.llm2action.input_size**-0.5)
+         std = self.action_modality_embed.weight.numel() ** -0.5
+         nn.init.trunc_normal_(self.action_modality_embed.weight, std=std, a=-3 * std, b=3 * std)
++        if self._tactile_modules_present:
++            for linear in (self.tactile2llm, self.llm2tactile):
++                std = linear.in_features**-0.5
++                nn.init.trunc_normal_(linear.weight, std=std, a=-3 * std, b=3 * std)
++                nn.init.zeros_(linear.bias)
++            for weight in (self.tactile_modality_embed.weight, self.tactile_stream_embed):
++                std = weight.shape[-1] ** -0.5
++                nn.init.trunc_normal_(weight, std=std, a=-3 * std, b=3 * std)
+ 
+     def _set_requires_grad(self):
+         """Freeze the VAE, which never trains, and the parts the training switches of the config leave frozen."""
+         self.vae.requires_grad_(False)
++        if self._tactile_modules_present:
++            self.tactile_encoder.requires_grad_(self.config.tactile_encoder_trainable)
++            if hasattr(self, "tactile_target_encoder"):
++                self.tactile_target_encoder.requires_grad_(False)
+         # Freeze the unused language modeling head, unless it is tied to the input embedding.
+         lm_head = self.mot_backbone.lm_head
+         if lm_head.weight is not self.mot_backbone.get_input_embeddings().weight:
+@@ -1115,6 +1305,7 @@ class Cosmos3VFMNetwork(nn.Module):
+         mm_token_type_ids: Tensor | None = None,
+         image_grid_thw: Tensor | None = None,
+         video_grid_thw: Tensor | None = None,
++        tactile_token_offsets: Tensor | None = None,
+     ) -> Tensor:
+         """
+         M-RoPE positions of both pathways, the native unified 3D M-RoPE.
+@@ -1181,7 +1372,13 @@ class Cosmos3VFMNetwork(nn.Module):
+         )  # [B,T_act]
+         action_position_ids = torch.stack([action_t, torch.zeros_like(action_t), torch.zeros_like(action_t)])
+ 
+-        return torch.cat([text_position_ids, video_position_ids, action_position_ids], dim=2)
++        parts = [text_position_ids, video_position_ids, action_position_ids]
++        if tactile_token_offsets is not None:
++            # Tactile token at dataset frame offset k: k frames on the time axis, like the actions.
++            per_frame = frame_step / (temporal_compression * self.config.video_stride)  # [B]
++            tactile_t = gen_start[:, None] + tactile_token_offsets.to(device)[None, :] * per_frame[:, None]
++            parts.append(torch.stack([tactile_t, torch.zeros_like(tactile_t), torch.zeros_like(tactile_t)]))
++        return torch.cat(parts, dim=2)
+ 
+     def merge_gen_stream(self, video_embeds: Tensor, action_embeds: Tensor | None) -> Tensor:
+         """Lay out the generation stream as `[video | actions]`."""
+@@ -1214,6 +1411,9 @@ class Cosmos3VFMNetwork(nn.Module):
+         pixel_values_videos: Tensor | None = None,
+         image_grid_thw: Tensor | None = None,
+         video_grid_thw: Tensor | None = None,
++        tactile: Tensor | None = None,
++        tactile_timesteps: Tensor | None = None,
++        tactile_condition_mask: Tensor | None = None,
+         **kwargs,
+     ) -> Cosmos3VFMNetworkOutput:
+         """
+@@ -1249,6 +1449,12 @@ class Cosmos3VFMNetwork(nn.Module):
+                 raise ValueError("actions need action_timesteps and action_condition_mask")
+             action_embeds = self.embed_actions(actions, action_timesteps, action_condition_mask, domain_id)
+         inputs_embeds_gen = self.merge_gen_stream(video_embeds, action_embeds)  # [B,G,D]
++        num_tactile_tokens = 0
++        if tactile is not None:
++            # Layout [video | actions | tactile].
++            tactile_embeds = self.embed_tactile(tactile, tactile_timesteps, tactile_condition_mask)
++            num_tactile_tokens = tactile_embeds.shape[1]
++            inputs_embeds_gen = torch.cat([inputs_embeds_gen, tactile_embeds], dim=1)
+ 
+         outputs = self.mot_backbone.model(
+             input_ids=input_ids,
+@@ -1261,8 +1467,14 @@ class Cosmos3VFMNetwork(nn.Module):
+             video_grid_thw=video_grid_thw,
+             **kwargs,
+         )
++        hidden_states_gen = outputs.last_hidden_state_gen
++        tactile_velocity = None
++        if num_tactile_tokens:
++            tactile_hidden_states = hidden_states_gen[:, -num_tactile_tokens:]
++            hidden_states_gen = hidden_states_gen[:, :-num_tactile_tokens]
++            tactile_velocity = self.llm2tactile(tactile_hidden_states).view(tactile.shape)
+         video_hidden_states, action_hidden_states = self.split_gen_stream(
+-            outputs.last_hidden_state_gen, num_video_tokens=video_embeds.shape[1]
++            hidden_states_gen, num_video_tokens=video_embeds.shape[1]
+         )
+         video_velocity = self.unpatchify(self.llm2vae(video_hidden_states), video_latents.shape)
+         action_velocity = None
+@@ -1272,6 +1484,7 @@ class Cosmos3VFMNetwork(nn.Module):
+         return Cosmos3VFMNetworkOutput(
+             video_velocity=video_velocity,
+             action_velocity=action_velocity,
++            tactile_velocity=tactile_velocity,
+             last_hidden_state=outputs.last_hidden_state,
+             last_hidden_state_gen=outputs.last_hidden_state_gen,
+         )
+@@ -1306,6 +1519,43 @@ class Cosmos3VFMNetwork(nn.Module):
+         timestep_embeds = self.embed_timesteps(action_timesteps).to(action_embeds.dtype)  # [B,T_act,D]
+         return action_embeds + timestep_embeds.masked_fill(action_condition_mask.unsqueeze(-1), 0.0)
+ 
++    def embed_tactile(self, tactile: Tensor, tactile_timesteps: Tensor, tactile_condition_mask: Tensor) -> Tensor:
++        """
++        Project the tactile latents `[B,T,S,L]`, add the modality and stream embeddings and the timestep
++        embedding of the noisy frames, `[B,T*S,D]` (time-major).
++        """
++        embeds = self.tactile2llm(tactile.to(self.tactile2llm.weight.dtype))  # [B,T,S,D]
++        embeds = self.tactile_modality_embed(embeds) + self.tactile_stream_embed.to(embeds.dtype)
++        timestep_embeds = self.embed_timesteps(tactile_timesteps).to(embeds.dtype)  # [B,T,D]
++        timestep_embeds = timestep_embeds.masked_fill(tactile_condition_mask.unsqueeze(-1), 0.0)
++        return (embeds + timestep_embeds.unsqueeze(2)).flatten(1, 2)
++
++    def encode_tactile(self, images: Tensor, target: bool = False) -> Tensor:
++        """
++        Tactile images `[B,F,S,3,H,W]` in [0, 1] to layer-normalized float32 latents `[B,F,S,L]`. `target` uses the
++        EMA target encoder when the encoder trains; the encoder runs without gradients when it is frozen.
++        """
++        batch_size, frames, streams = images.shape[:3]
++        if frames == 0:
++            return images.new_zeros(batch_size, 0, streams, self.config.tactile_latent_dim, dtype=torch.float32)
++        encoder = self.tactile_encoder
++        if target and hasattr(self, "tactile_target_encoder"):
++            encoder = self.tactile_target_encoder
++        trains = self.config.tactile_encoder_trainable and not target and torch.is_grad_enabled()
++        with torch.set_grad_enabled(trains):
++            latents = encoder(images.flatten(0, 2))  # [B*F*S,L]
++        latents = F.layer_norm(latents.float(), latents.shape[-1:])
++        return latents.view(batch_size, frames, streams, -1)
++
++    @torch.no_grad()
++    def update_tactile_target(self, decay: float) -> None:
++        """EMA of the tactile encoder into the target encoder (parameters and buffers)."""
++        target = self.tactile_target_encoder
++        for target_param, param in zip(target.parameters(), self.tactile_encoder.parameters(), strict=True):
++            target_param.lerp_(param.detach().to(target_param.dtype), 1.0 - decay)
++        for target_buffer, buffer in zip(target.buffers(), self.tactile_encoder.buffers(), strict=True):
++            target_buffer.copy_(buffer)
++
+     def patchify(self, video_latents: Tensor) -> Tensor:
+         """`[B,C,T,H,W]` to `[B,T,h*w,p*p*C]`, zero padding H and W at the bottom and right to multiples of p."""
+         patch_size = self.config.latent_patch_size
+diff --git a/src/lerobot/policies/cosmos3/tactile_cosmos3.py b/src/lerobot/policies/cosmos3/tactile_cosmos3.py
+new file mode 100644
+index 00000000..1a209eb7
+--- /dev/null
++++ b/src/lerobot/policies/cosmos3/tactile_cosmos3.py
+@@ -0,0 +1,74 @@
++# UniVTAC extension of the Cosmos3 policy: the tactile encoder of the tactile modality.
++"""
++UniVTAC tactile encoder for the tactile modality of the Cosmos3 generation pathway.
++
++The UniVTAC ResNet (`encoder/network.py` `Tactile` of the UniVTAC repo) maps one tactile image in [0, 1] to one
++latent: torchvision ResNet whose classifier head is the latent projection (`num_classes = latent_dim`).
++"""
++
++import logging
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F  # noqa: N812
++from torch import Tensor, nn
++
++SUPPORTED_BACKBONES = ("resnet18", "resnet34", "resnet50")
++
++
++class UniVTACTactileEncoder(nn.Module):
++    """
++    Tactile images `[N, 3, H, W]` in [0, 1] to latents `[N, latent_dim]`, resized to `input_size` first. The
++    BatchNorm statistics stay at their pretraining values (the layers stay in eval mode).
++
++    Args:
++        backbone: "resnet18", "resnet34" or "resnet50".
++        latent_dim: Width of the latent, the `num_classes` of the ResNet.
++        input_size: Height and width the images are resized to.
++        pretrained_path: UniVTAC checkpoint (`best.pth`). A missing file only warns: the weights then come from
++            the policy checkpoint.
++    """
++
++    def __init__(
++        self,
++        backbone: str = "resnet18",
++        latent_dim: int = 512,
++        input_size: tuple[int, int] = (224, 224),
++        pretrained_path: str | None = None,
++    ):
++        super().__init__()
++        if backbone not in SUPPORTED_BACKBONES:
++            raise ValueError(f"tactile_backbone must be one of {SUPPORTED_BACKBONES}, got {backbone!r}")
++        from torchvision import models
++
++        self.backbone = getattr(models, backbone)(num_classes=latent_dim)
++        self.input_size = tuple(input_size)
++        if pretrained_path:
++            path = Path(pretrained_path).expanduser()
++            if path.exists():
++                self.load_univtac_weights(path)
++            else:
++                logging.warning(f"UniVTAC tactile checkpoint {path} not found, keeping the initialization.")
++
++    def load_univtac_weights(self, path: Path) -> None:
++        """Load the backbone of a UniVTAC checkpoint (full `Tactile` state dict or bare ResNet state dict)."""
++        state = torch.load(str(path), map_location="cpu")
++        if isinstance(state, dict) and isinstance(state.get("state_dict"), dict):
++            state = state["state_dict"]
++        state = {k.removeprefix("backbone."): v for k, v in state.items() if not k.startswith("decoders.")}
++        missing, unexpected = self.backbone.load_state_dict(state, strict=False)
++        if missing:
++            raise RuntimeError(f"UniVTAC checkpoint {path} misses backbone keys {missing[:5]}...")
++        logging.info(f"Loaded the UniVTAC tactile encoder from {path} ({len(unexpected)} unused keys).")
++
++    def train(self, mode: bool = True):
++        super().train(mode)
++        for module in self.modules():
++            if isinstance(module, nn.modules.batchnorm._BatchNorm):
++                module.eval()
++        return self
++
++    def forward(self, images: Tensor) -> Tensor:
++        if tuple(images.shape[-2:]) != self.input_size:
++            images = F.interpolate(images.float(), size=self.input_size, mode="bilinear", align_corners=False)
++        return self.backbone(images.to(self.backbone.fc.weight.dtype))
+-- 
+2.52.0
+

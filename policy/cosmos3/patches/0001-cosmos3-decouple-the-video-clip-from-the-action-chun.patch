@@ -1,0 +1,260 @@
+From 1aa45e3bced97acae85b4eddedd90b0fe8b74be1 Mon Sep 17 00:00:00 2001
+From: Charles Fu <noreply@local>
+Date: Sun, 15 Nov 2026 01:48:14 +0100
+Subject: [PATCH 1/2] cosmos3: decouple the video clip from the action chunk
+ (video_stride, video_latent_frames)
+
+---
+ .../policies/cosmos3/configuration_cosmos3.py | 44 +++++++++++++++----
+ .../policies/cosmos3/modeling_cosmos3.py      | 19 +++++---
+ .../policies/cosmos3/processor_cosmos3.py     | 36 +++++++++++++--
+ 3 files changed, 80 insertions(+), 19 deletions(-)
+
+diff --git a/src/lerobot/policies/cosmos3/configuration_cosmos3.py b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+index 13bfbb68..ba00e4ac 100644
+--- a/src/lerobot/policies/cosmos3/configuration_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+@@ -335,6 +335,13 @@ class Cosmos3Config(PreTrainedConfig):
+     n_obs_steps: int = 1
+     chunk_size: int = 16  # Number of action steps predicted per denoising call
+     n_action_steps: int = 16  # Number of action steps to execute
++    # Video clip of the world model, decoupled from the action chunk (UniVTAC extension). The clip holds the
++    # condition frame and 4 * video_latent_frames future frames, video_stride dataset frames apart (the VAE
++    # encodes 4 consecutive clip frames into one latent frame, so the clip frames must be evenly spaced).
++    # video_latent_frames=None keeps the upstream layout: the clip ends with the action chunk,
++    # video_latent_frames = chunk_size / (4 * video_stride).
++    video_stride: int = 1
++    video_latent_frames: int | None = None
+     # Actions are zero padded to this width, the width of the action projections.
+     max_action_dim: int = 64
+     # Storage dtype of the parameters, except the modules kept in float32.
+@@ -489,11 +496,17 @@ class Cosmos3Config(PreTrainedConfig):
+         if not 0 <= self.domain_id < self.num_embodiment_domains:
+             raise ValueError(f"domain_id={self.domain_id} is outside [0, {self.num_embodiment_domains}).")
+         temporal_compression = self.vae.scale_factor_temporal or 1
+-        if self.chunk_size % temporal_compression != 0:
+-            raise ValueError(
+-                f"chunk_size={self.chunk_size} must be a multiple of the VAE temporal compression "
+-                f"{temporal_compression}: the clip of chunk_size + 1 frames encodes to whole latent frames."
+-            )
++        if self.video_stride < 1:
++            raise ValueError(f"video_stride={self.video_stride} must be >= 1.")
++        if self.video_latent_frames is None:
++            if self.chunk_size % (temporal_compression * self.video_stride) != 0:
++                raise ValueError(
++                    f"chunk_size={self.chunk_size} must be a multiple of the VAE temporal compression "
++                    f"{temporal_compression} times video_stride={self.video_stride} when video_latent_frames is "
++                    "None (the clip then ends with the chunk); or set video_latent_frames."
++                )
++        elif self.video_latent_frames < 1:
++            raise ValueError(f"video_latent_frames={self.video_latent_frames} must be >= 1.")
+         if not 0.0 <= self.cfg_dropout_rate <= 1.0:
+             raise ValueError(f"cfg_dropout_rate={self.cfg_dropout_rate} is outside [0, 1].")
+ 
+@@ -551,15 +564,28 @@ class Cosmos3Config(PreTrainedConfig):
+     def observation_delta_indices(self) -> None:
+         return None
+ 
++    @property
++    def num_video_latent_frames(self) -> int:
++        """Future latent frames of the clip (the condition latent frame not included)."""
++        if self.video_latent_frames is not None:
++            return self.video_latent_frames
++        return self.chunk_size // ((self.vae.scale_factor_temporal or 1) * self.video_stride)
++
++    @property
++    def video_frame_offsets(self) -> list[int]:
++        """Dataset frame offsets of the clip: 0, s, 2s, ..., 4 * video_latent_frames * s."""
++        num_frames = (self.vae.scale_factor_temporal or 1) * self.num_video_latent_frames + 1
++        return [self.video_stride * i for i in range(num_frames)]
++
+     @property
+     def image_observation_delta_indices(self) -> list[int]:
+-        """The video clip of a training sample: the condition frame and the chunk_size frames the actions lead to."""
+-        return list(range(self.chunk_size + 1))
++        """The video clip of a training sample: the condition frame and the future frames (video_frame_offsets)."""
++        return self.video_frame_offsets
+ 
+     @property
+     def drop_n_last_frames(self) -> int:
+-        """Training windows end inside their episode (no padded clips)."""
+-        return self.chunk_size
++        """Training windows end inside their episode (no padded clips or actions)."""
++        return max(self.chunk_size, self.video_frame_offsets[-1])
+ 
+     @property
+     def action_delta_indices(self) -> list[int]:
+diff --git a/src/lerobot/policies/cosmos3/modeling_cosmos3.py b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+index b1ca23aa..49431cb6 100644
+--- a/src/lerobot/policies/cosmos3/modeling_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+@@ -321,7 +321,7 @@ class Cosmos3Policy(PreTrainedPolicy):
+         `[frames, height, width, 3]`. The chunks are decoded one by one and their frames concatenated.
+         """
+         vae = self.model.network.vae
+-        latent_frames_per_chunk = 1 + self.config.chunk_size // vae.config.scale_factor_temporal
++        latent_frames_per_chunk = 1 + self.config.num_video_latent_frames
+         if latents.shape[2] % latent_frames_per_chunk != 0:
+             raise ValueError(
+                 f"{latents.shape[2]} latent frames do not split into chunks of {latent_frames_per_chunk}."
+@@ -549,9 +549,12 @@ class OmniMoTModel(nn.Module):
+         """
+         batch_size, device = video_grid_thw_gen.shape[0], pixel_values_videos_gen.device
+         chunk_size = self.config.chunk_size
+-        num_frames = (int(video_grid_thw_gen[0, 0]) - 1) * self.network.vae.config.scale_factor_temporal + 1
+-        if num_frames != chunk_size + 1:
+-            raise ValueError(f"The clip has {num_frames} frames, chunk_size + 1 is {chunk_size + 1}.")
++        num_latent_frames = int(video_grid_thw_gen[0, 0])
++        if num_latent_frames != 1 + self.config.num_video_latent_frames:
++            raise ValueError(
++                f"The clip has {num_latent_frames} latent frames, the config "
++                f"{1 + self.config.num_video_latent_frames}."
++            )
+         # Placeholder actions, replaced by noise.
+         actions = torch.zeros(batch_size, chunk_size, self.config.max_action_dim, device=device)
+         packed_actions = self.pack_actions(actions, state)
+@@ -681,7 +684,10 @@ class OmniMoTModel(nn.Module):
+         temporal_compression = self.network.vae.config.scale_factor_temporal
+         num_frames = (num_latent_frames - 1) * temporal_compression + 1  # pixel frames of the clip
+         num_base_actions = num_actions - num_history_actions
+-        if mode == "policy" or num_base_actions == num_frames - 1:  # Case A
++        if self.config.video_stride != 1 or self.config.video_latent_frames is not None:
++            # Video decoupled from the chunk: one action per dataset frame, the state action when configured.
++            has_state = self.config.use_state
++        elif mode == "policy" or num_base_actions == num_frames - 1:  # Case A
+             has_state = False
+         elif num_base_actions == num_frames:  # Case B
+             has_state = True
+@@ -1170,7 +1176,8 @@ class Cosmos3VFMNetwork(nn.Module):
+         action_frames = torch.arange(num_actions, device=device, dtype=torch.float32)
+         action_frames = action_frames[None, :] + action_start_frame_offset.to(device)[:, None]  # [B,T_act]
+         action_t = (
+-            gen_start[:, None] + action_frames * (frame_step / temporal_compression)[:, None]
++            gen_start[:, None]
++            + action_frames * (frame_step / (temporal_compression * self.config.video_stride))[:, None]
+         )  # [B,T_act]
+         action_position_ids = torch.stack([action_t, torch.zeros_like(action_t), torch.zeros_like(action_t)])
+ 
+diff --git a/src/lerobot/policies/cosmos3/processor_cosmos3.py b/src/lerobot/policies/cosmos3/processor_cosmos3.py
+index 9a5bf611..57c1e423 100644
+--- a/src/lerobot/policies/cosmos3/processor_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/processor_cosmos3.py
+@@ -310,6 +310,8 @@ class Cosmos3VideoCanvasProcessorStep(ComplementaryDataProcessorStep):
+     chunk_size: int
+     temporal_compression: int = 4
+     spatial_compression: int = 16
++    video_stride: int = 1
++    video_latent_frames: int | None = None
+ 
+     def complementary_data(self, complementary_data):
+         observation = self.transition.get(TransitionKey.OBSERVATION) or {}
+@@ -319,13 +321,16 @@ class Cosmos3VideoCanvasProcessorStep(ComplementaryDataProcessorStep):
+         canvas, (content_h, content_w) = self.fit_canvas(frames)
+ 
+         batch_size, device = canvas.shape[0], canvas.device
+-        num_latent_frames = 1 + self.chunk_size // self.temporal_compression
++        future = self.video_latent_frames
++        if future is None:
++            future = self.chunk_size // (self.temporal_compression * self.video_stride)
++        num_latent_frames = 1 + future
+         grid = [
+             num_latent_frames,
+             content_h // self.spatial_compression,
+             content_w // self.spatial_compression,
+         ]
+-        seconds_per_latent_frame = self.temporal_compression / self.fps
++        seconds_per_latent_frame = self.temporal_compression * self.video_stride / self.fps
+         complementary_data["pixel_values_videos_gen"] = canvas.permute(0, 2, 1, 3, 4).float() / 127.5 - 1.0
+         complementary_data["video_grid_thw_gen"] = torch.tensor(grid, device=device).expand(batch_size, 3)
+         complementary_data["second_per_grid_ts_gen"] = torch.full(
+@@ -406,6 +411,8 @@ class Cosmos3VideoCanvasProcessorStep(ComplementaryDataProcessorStep):
+             "chunk_size": self.chunk_size,
+             "temporal_compression": self.temporal_compression,
+             "spatial_compression": self.spatial_compression,
++            "video_stride": self.video_stride,
++            "video_latent_frames": self.video_latent_frames,
+         }
+ 
+     def transform_features(
+@@ -441,6 +448,9 @@ class Cosmos3PromptProcessorStep(ComplementaryDataProcessorStep):
+     fps: float | None
+     chunk_size: int
+     use_state: bool
++    temporal_compression: int = 4
++    video_stride: int = 1
++    video_latent_frames: int | None = None
+ 
+     def complementary_data(self, complementary_data):
+         tasks = complementary_data.get("task")
+@@ -464,7 +474,12 @@ class Cosmos3PromptProcessorStep(ComplementaryDataProcessorStep):
+             return ""
+         if not task.endswith((".", "!", "?")):
+             task = f"{task}."
+-        duration = (self.chunk_size + 1) / fps
++        # The prompt describes the clip: its frames are video_stride dataset frames apart.
++        future = self.video_latent_frames
++        if future is None:
++            future = self.chunk_size // (self.temporal_compression * self.video_stride)
++        fps = fps / self.video_stride
++        duration = (self.temporal_compression * future + 1) / fps
+         rounded = round(duration)
+         # The ratio name of a tier canvas, the reduced width and height of another canvas.
+         ratios = [ratio for sizes in VIDEO_CANVAS_SIZES.values() for ratio, size in sizes.items()
+@@ -482,7 +497,7 @@ class Cosmos3PromptProcessorStep(ComplementaryDataProcessorStep):
+                 }
+             ],
+             "duration": f"{int(duration)}s",
+-            "fps": float(int(fps)),
++            "fps": float(int(fps)) if float(fps).is_integer() else round(float(fps), 2),
+             "resolution": {"H": canvas_h, "W": canvas_w},
+             "aspect_ratio": aspect_ratio,
+         }
+@@ -494,6 +509,9 @@ class Cosmos3PromptProcessorStep(ComplementaryDataProcessorStep):
+             "fps": self.fps,
+             "chunk_size": self.chunk_size,
+             "use_state": self.use_state,
++            "temporal_compression": self.temporal_compression,
++            "video_stride": self.video_stride,
++            "video_latent_frames": self.video_latent_frames,
+         }
+ 
+     def transform_features(
+@@ -618,12 +636,17 @@ def make_cosmos3_pre_post_processors(
+             chunk_size=config.chunk_size,
+             temporal_compression=config.vae.scale_factor_temporal or 1,
+             spatial_compression=config.vae.scale_factor_spatial or 1,
++            video_stride=config.video_stride,
++            video_latent_frames=config.video_latent_frames,
+         ),
+         Cosmos3PromptProcessorStep(
+             view_description=config.view_description,
+             fps=config.fps,
+             chunk_size=config.chunk_size,
+             use_state=config.use_state,
++            temporal_compression=config.vae.scale_factor_temporal or 1,
++            video_stride=config.video_stride,
++            video_latent_frames=config.video_latent_frames,
+         ),
+         Cosmos3TokenizerProcessorStep(
+             tokenizer_name=config.tokenizer_name, cfg_dropout_rate=config.cfg_dropout_rate
+@@ -668,12 +691,17 @@ def make_cosmos3_pre_post_processors_from_pretrained(
+             "view_size": config.view_size,
+             "fps": config.fps,
+             "chunk_size": config.chunk_size,
++            "video_stride": config.video_stride,
++            "video_latent_frames": config.video_latent_frames,
+         },
+         "cosmos3_prompt_processor": {
+             "view_description": config.view_description,
+             "fps": config.fps,
+             "chunk_size": config.chunk_size,
+             "use_state": config.use_state,
++            "temporal_compression": config.vae.scale_factor_temporal or 1,
++            "video_stride": config.video_stride,
++            "video_latent_frames": config.video_latent_frames,
+         },
+         "cosmos3_tokenizer_processor": {"cfg_dropout_rate": config.cfg_dropout_rate},
+     }
+-- 
+2.52.0
+
