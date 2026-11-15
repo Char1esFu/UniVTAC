@@ -245,8 +245,6 @@ class SmolVLAConfig(PreTrainedConfig):
                 self.use_tactile and (self.vitac_encoder_name or "").lower() == "univtac"
             ):
                 raise ValueError("wam_use_tactile needs use_tactile=True and vitac_encoder_name='univtac'")
-            if self.rtc_config is not None and self.rtc_config.enabled:
-                raise NotImplementedError("RTC is not supported together with wam_enabled")
 
     def validate_features(self) -> None:
         # Keep only the selected tactile streams; the dataset also carries the

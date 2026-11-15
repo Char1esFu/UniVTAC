@@ -208,6 +208,16 @@ TASK_NAME=lift_bottle RUN_TAG=lift_bottle-clean-100_wam bash scripts/train.sh \
 ```
 
 Inference encodes the current frame online and keeps the window in the policy,
-one frame per `predict_action_chunk` call. Not yet compatible with the RTC10
-default: `wam_enabled` rejects RTC, and with replanning every 10 actions the
-window would have to be updated every env step instead of every call.
+one frame per env step: `predict_action_chunk` appends the current frame, and
+on the steps without a new chunk (RTC10 executes 10 actions per chunk) the
+deploy calls `policy.wam_observe(batch)`, so the window holds t-1 and t as in
+training. RTC guides the action part of the joint denoising; the future
+latents use the velocity of the same network call.
+
+Evaluate the cluster checkpoints after copying `checkpoints/last/pretrained_model`
+to `outputs/smolvla_vitac_put_bottle_in_shelf-clean-100_{wam,wam_tacfrozen}/checkpoints/last/`:
+
+```bash
+TRAIN_CONFIG=wam EP_NUM=100 \
+    python scripts/eval_policy.py put_bottle_in_shelf clean smolvla/deploy --headless
+```

@@ -258,7 +258,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        # World action model: latents of the frames seen so far (one per call).
+        # World action model: latents of the last frames, one per env step (see wam_observe).
         self._wam_buffer = deque(maxlen=1 - min(self.config.wam_history_offsets, default=0))
 
     def init_rtc_processor(self):
@@ -608,14 +608,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             out["tactile_is_pad"] = {k: batch[f"{k}_is_pad"] for k in self.config.tactile_keys}
         return out
 
-    @torch.no_grad()
-    def _wam_window(self, batch):
-        """Inference observation window: latents of the last frames seen by this policy.
-
-        One entry is appended per call (the deploy runs one call per env step);
-        before the window is full the oldest frame repeats, as the training
-        window is clamped at the episode start.
-        """
+    def _wam_current(self, batch):
+        """Raw latents of the current frame of a (preprocessed) batch."""
         vision, tactile = [], []
         if self.config.wam_use_vision:
             for key in self.config.wam_vision_keys:
@@ -625,7 +619,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 vision.append(img * 2.0 - 1.0)
         if self.config.wam_use_tactile:
             tactile = [self._current_frame(batch, key) for key in self.config.tactile_keys]
-        self._wam_buffer.append(self.model.wam_current_raw(vision, tactile))
+        return self.model.wam_current_raw(vision, tactile)
+
+    @torch.no_grad()
+    def wam_observe(self, batch):
+        """Push the current frame into the observation window without predicting.
+
+        The window holds one frame per env step (``wam_history_stride`` steps
+        apart, as the dataset frames in training). ``predict_action_chunk``
+        appends its frame itself, so a deploy that predicts a chunk only every
+        few steps calls this on the other steps (not on the predicting ones).
+        """
+        if self.config.wam_enabled:
+            self._wam_buffer.append(self._wam_current(batch))
+
+    @torch.no_grad()
+    def _wam_window(self, batch):
+        """Inference observation window: latents of the last env steps.
+
+        The current frame is appended here (``wam_observe`` covers the steps
+        without a prediction); before the window is full the oldest frame
+        repeats, as the training window is clamped at the episode start.
+        """
+        self._wam_buffer.append(self._wam_current(batch))
         last = len(self._wam_buffer) - 1
         steps = [max(0, last + o) for o in self.config.wam_history_offsets]
         raw = {
@@ -1513,7 +1529,7 @@ class VLAFlowMatching(nn.Module):
 
         if self.wam_specs:
             return self._sample_actions_wam(
-                noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window
+                noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window, **kwargs
             )
 
         x_t = noise
@@ -1554,13 +1570,16 @@ class VLAFlowMatching(nn.Module):
         return x_t
 
     def _sample_actions_wam(
-        self, noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window
+        self, noise, prefix_pad_masks, past_key_values, film_params, num_steps, dt, wam_window, **kwargs
     ):
         """Euler integration of the actions together with the future latents.
 
         "joint": all modalities share the time and are denoised together.
         "marginal": the future latents stay pure noise at time 1 (the
         condition trained with wam_marginal_prob); only the actions move.
+        With RTC the action velocity is guided towards the unexecuted part of
+        the previous chunk (``kwargs`` of ``RTCProcessor.denoise_step``); the
+        future latents use the velocity of the same network call.
         The predicted future latents are kept in ``self.last_wam_latents``.
         """
         bsize, device = noise.shape[0], noise.device
@@ -1576,16 +1595,33 @@ class VLAFlowMatching(nn.Module):
         for step in range(num_steps):
             time = torch.full((bsize,), 1.0 + step * dt, dtype=torch.float32, device=device)
             wam_time = {name: time if joint else torch.ones_like(time) for name in self.wam_future_names}
-            v_t, wam_v = self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=x_t,
-                timestep=time,
-                film_params=film_params,
-                wam_window=wam_window,
-                wam_x=wam_x,
-                wam_time=wam_time,
-            )
+            outputs = {}
+
+            def denoise(input_x_t, time=time, wam_x=wam_x, wam_time=wam_time, outputs=outputs):
+                v, outputs["wam_v"] = self.denoise_step(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=input_x_t,
+                    timestep=time,
+                    film_params=film_params,
+                    wam_window=wam_window,
+                    wam_x=wam_x,
+                    wam_time=wam_time,
+                )
+                return v
+
+            if self._rtc_enabled():
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+                    inference_delay=kwargs.get("inference_delay"),
+                    time=1.0 + step * dt,
+                    original_denoise_step_partial=denoise,
+                    execution_horizon=kwargs.get("execution_horizon"),
+                )
+            else:
+                v_t = denoise(x_t)
+            wam_v = {name: v.detach() for name, v in outputs["wam_v"].items()}
             x_t = x_t + dt * v_t
             if joint:
                 wam_x = {name: wam_x[name] + dt * wam_v[name] for name in self.wam_future_names}

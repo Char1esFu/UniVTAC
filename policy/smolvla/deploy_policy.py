@@ -311,6 +311,12 @@ class _SmolVLALocalPolicy(BasePolicy):
             )
 
         self.model_config = _get_policy_config(self.model)
+        # The SmolVLAPolicy itself (under a PEFT wrapper when the checkpoint is an adapter).
+        self._policy = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        self.wam_enabled = bool(getattr(self.model_config, "wam_enabled", False))
+        if self.wam_enabled:
+            print(f"[smolvla] world action model: window offsets {self.model_config.wam_history_offsets}, "
+                  f"inference mode {self.model_config.wam_inference_mode}")
         if self.image_size is None:
             self.image_size = self._feature_hw(default=(256, 256), tactile=False)
         if self.tactile_size is None:
@@ -581,6 +587,10 @@ class _SmolVLALocalPolicy(BasePolicy):
         import torch
 
         if self.replan_every > 0 and self._action_queue:
+            if self.wam_enabled:
+                # The world action model's observation window advances every env step, as in
+                # training (one dataset frame per step), also on steps without a new chunk.
+                self._policy.wam_observe(batch)
             return self._action_queue.popleft()
         kwargs = {}
         if self.use_rtc and self._prev_chunk is not None:

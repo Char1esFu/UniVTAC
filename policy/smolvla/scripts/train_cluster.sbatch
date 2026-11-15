@@ -46,6 +46,8 @@ export TASK_NAME TASK_CONFIG EXPERT_DATA_NUM
 
 cd "$REPO/policy/smolvla"
 export PYTHONPATH=$PWD/src
+# Single-GPU jobs can share a node; torchrun's default rendezvous port 29500 then collides.
+export MASTER_PORT=${MASTER_PORT:-$((20000 + SLURM_JOB_ID % 20000))}
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 echo "[train] task=$TASK_NAME dataset=$DATASET_ROOT output=$OUTPUT_DIR git=$(git rev-parse --short HEAD)"
 
